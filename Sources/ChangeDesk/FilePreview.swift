@@ -45,13 +45,16 @@ extension PreviewKind {
 struct FilePreview: View {
     let snapshot: Snapshot
     let path: String
+    var viewport: TextViewport?
+    var jump: TextJump?
+    var searchMarks: FileSearchMarks?
 
     var body: some View {
         SwiftUI.Group {
             if !snapshot.present {
                 placeholder("此版本没有该文件", symbol: "doc.badge.minus")
             } else if let text = snapshot.text {
-                NativeText(text: text)
+                NativeText(text: text, viewport: viewport, jump: jump, searchMarks: searchMarks)
             } else if let file = snapshot.preview {
                 switch snapshot.kind {
                 case .image: ImagePreview(file: file, description: path)
@@ -82,9 +85,9 @@ struct FilePreview: View {
 private struct ImagePreview: View {
     let file: PreviewFile
     let description: String
-    @State private var image: NSImage?
-    @State private var loaded = false
-    @State private var zoom = false
+    @DeskState private var image: NSImage?
+    @DeskState private var loaded = false
+    @DeskState private var zoom = false
 
     var body: some View {
         SwiftUI.Group {

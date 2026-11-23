@@ -2,9 +2,9 @@
 import PackageDescription
 
 let package = Package(
-    name: "ChangeDesk",
+    name: "diff+",
     platforms: [.macOS(.v14)],
-    products: [.executable(name: "ChangeDesk", targets: ["ChangeDesk"])],
+    products: [.executable(name: "diff+", targets: ["ChangeDesk"])],
     targets: [.executableTarget(name: "ChangeDesk")],
     swiftLanguageModes: [.v5]
 )

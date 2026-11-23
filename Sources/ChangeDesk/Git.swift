@@ -117,11 +117,13 @@ struct Snapshot: Sendable {
 }
 
 struct Comparison: Sendable {
+    let id = UUID()
     let left: Snapshot
     let right: Snapshot
     let disk: Snapshot
     let rows: [CodeRow]
     var aligned: Bool = true
+    var ignoresWhitespace = false
 
     var hunks: [Range<Int>] {
         var ranges: [Range<Int>] = []
@@ -145,6 +147,7 @@ struct CodeRow: Sendable {
     let leftNumber: Int?
     let rightNumber: Int?
     let changed: Bool
+    var emphasis: InlineDiff? = nil
 }
 
 enum Git {
@@ -387,7 +390,7 @@ enum Git {
         return Snapshot(title, kind: kind, size: count, preview: preview)
     }
 
-    static func compare(_ file: Change, layer: Layer, repo: Worktree) throws -> Comparison {
+    static func compare(_ file: Change, layer: Layer, repo: Worktree, ignoresWhitespace: Bool = false) throws -> Comparison {
         let current = try disk(file.path, in: repo.url)
         let old = file.oldPath ?? file.path
         let left: Snapshot
@@ -416,18 +419,19 @@ enum Git {
         guard let l, let r else {
             return Comparison(left: left, right: right, disk: current, rows: [])
         }
-        let result = try align(l, r)
-        return Comparison(left: left, right: right, disk: current, rows: result.0, aligned: result.1)
+        let result = try align(l, r, ignoresWhitespace: ignoresWhitespace)
+        return Comparison(left: left, right: right, disk: current, rows: result.0,
+                          aligned: result.1, ignoresWhitespace: ignoresWhitespace)
     }
 
-    static func align(_ left: String, _ right: String) throws -> ([CodeRow], Bool) {
+    static func align(_ left: String, _ right: String, ignoresWhitespace: Bool = false) throws -> ([CodeRow], Bool) {
         // components preserves every blank line and the terminal newline. Split on LF
         // rather than Character because Swift treats a CRLF pair as one grapheme.
         let a = left.isEmpty ? [] : left.components(separatedBy: "\n")
         let b = right.isEmpty ? [] : right.components(separatedBy: "\n")
         guard max(a.count, b.count) <= 30_000 else { return ([], false) }
         let fm = FileManager.default
-        let dir = fm.temporaryDirectory.appendingPathComponent("ChangeDesk-"+UUID().uuidString)
+        let dir = fm.temporaryDirectory.appendingPathComponent("diffplus-"+UUID().uuidString)
         try fm.createDirectory(at: dir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         defer { try? fm.removeItem(at: dir) }
         let old = dir.appendingPathComponent("old")
@@ -435,12 +439,20 @@ enum Git {
         // Emit one physical line for each display line, including an empty terminal row.
         try (a.isEmpty ? "" : a.joined(separator: "\n")+"\n").write(to: old, atomically: false, encoding: .utf8)
         try (b.isEmpty ? "" : b.joined(separator: "\n")+"\n").write(to: new, atomically: false, encoding: .utf8)
-        let patch = try run(["-c", "diff.color=false", "diff", "--no-index", "--no-ext-diff", "--no-textconv", "--no-color", "--unified=0", "--", "old", "new"], at: dir, allow: [0, 1]).text
+        var args = ["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--no-color", "--text", "--unified=0"]
+        if ignoresWhitespace { args.append("--ignore-all-space") }
+        let patch = try run(args + ["--", "old", "new"], at: dir, allow: [0, 1]).text
         let regex = try NSRegularExpression(pattern: #"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@"#)
         var rows: [CodeRow] = []
         var i = 0, j = 0
+        var emphasisBudget = 1_000_000
         func append(_ lhs: Bool, _ rhs: Bool, changed: Bool) {
-            rows.append(CodeRow(left: lhs ? a[i] : nil, right: rhs ? b[j] : nil, leftNumber: lhs ? i+1 : nil, rightNumber: rhs ? j+1 : nil, changed: changed))
+            var row = CodeRow(left: lhs ? a[i] : nil, right: rhs ? b[j] : nil,
+                              leftNumber: lhs ? i+1 : nil, rightNumber: rhs ? j+1 : nil, changed: changed)
+            if changed, let left = row.left, let right = row.right, emphasisBudget > 0 {
+                row.emphasis = InlineDiff.compare(left, right, budget: &emphasisBudget)
+            }
+            rows.append(row)
             if lhs { i += 1 }
             if rhs { j += 1 }
         }
@@ -459,7 +471,7 @@ enum Git {
             for k in 0..<max(ac, bc) { append(k < ac, k < bc, changed: true) }
         }
         guard a.count-i == b.count-j else { return ([], false) }
-        while i < a.count { append(true, true, changed: a[i] != b[j]) }
+        while i < a.count { append(true, true, changed: false) }
         return (rows, true)
     }
 }

@@ -20,8 +20,10 @@ final class Workspace: ObservableObject {
     @Published var editing = false
     @Published var draft = ""
     @Published var layoutRevision = UUID()
+    @Published private(set) var ignoresWhitespace: Bool
+    @Published private(set) var recentWorkspaces: [URL]
 
-    enum Mode: String, CaseIterable { case compare = "左右对比", full = "完整文件" }
+    enum Mode: String, CaseIterable { case compare = "并排", unified = "行内", full = "文件" }
     enum FullVersion: String, CaseIterable { case left = "左侧版本", right = "右侧版本", disk = "工作区" }
     @Published var fullVersion: FullVersion = .right
     var repo: Worktree? { repos.first { $0.id == repoID } }
@@ -34,13 +36,17 @@ final class Workspace: ObservableObject {
         case .disk: return comparison?.disk
         }
     }
+    var hasSearchableText: Bool {
+        if mode == .full { return editing || fullSnapshot?.text != nil }
+        return comparison?.left.text != nil || comparison?.right.text != nil
+    }
     var canEdit: Bool {
         guard let disk = comparison?.disk else { return false }
         return disk.present && disk.text != nil && !disk.label.contains("符号链接")
     }
 
     private var watch: DirectoryWatch?
-    private var environment = UserDefaults.standard
+    private let environment: UserDefaults
     private var refreshToken = UUID()
     private var loadToken = UUID()
     private var delayedRefresh: Task<Void, Never>?
@@ -48,6 +54,17 @@ final class Workspace: ObservableObject {
     private var manualRefreshQueued = false
     private var scanTask: Task<Void, Never>?
     private var changedPaths: Set<String> = []
+
+    init(environment: UserDefaults = .standard) {
+        self.environment = environment
+        ignoresWhitespace = environment.bool(forKey: "ignoresWhitespace")
+        let stored = environment.stringArray(forKey: "recentWorkspaces") ?? []
+        let last = environment.string(forKey: "workspace").map { [$0] } ?? []
+        var seen: Set<String> = []
+        recentWorkspaces = (last + stored).filter { seen.insert($0).inserted }.prefix(8).map {
+            URL(fileURLWithPath: $0, isDirectory: true)
+        }
+    }
 
     func start() {
         guard directory == nil else { return }
@@ -69,6 +86,16 @@ final class Workspace: ObservableObject {
         if panel.runModal() == .OK, let url = panel.url { open(url) }
     }
 
+    func openRecent(_ url: URL) {
+        guard url != directory, !busy else { return }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            issue = "无法打开工作区：\(url.path)"
+            return
+        }
+        if leaveEditor() { open(url) }
+    }
+
     func open(_ url: URL) {
         let root = url.resolvingSymlinksInPath().standardizedFileURL
         scanTask?.cancel()
@@ -79,6 +106,8 @@ final class Workspace: ObservableObject {
         loadToken = UUID()
         directory = root
         environment.set(root.path, forKey: "workspace")
+        recentWorkspaces = Array(([root] + recentWorkspaces.filter { $0 != root }).prefix(8))
+        environment.set(recentWorkspaces.map(\.path), forKey: "recentWorkspaces")
         repos = []
         repoID = nil
         fileID = nil
@@ -239,6 +268,13 @@ final class Workspace: ObservableObject {
         loadFile()
     }
 
+    func setIgnoresWhitespace(_ enabled: Bool) {
+        guard enabled != ignoresWhitespace, !editing, !busy else { return }
+        ignoresWhitespace = enabled
+        environment.set(enabled, forKey: "ignoresWhitespace")
+        loadFile(preserveScroll: true)
+    }
+
     func loadFile(preserveScroll: Bool = false) {
         let token = UUID()
         loadToken = token
@@ -247,9 +283,10 @@ final class Workspace: ObservableObject {
         guard let file, let repo else { loading = false; return }
         loading = true
         let selectedLayer = layer
+        let ignoresWhitespace = self.ignoresWhitespace
         Task {
             let result = await Task.detached(priority: .userInitiated) {
-                Result { try Git.compare(file, layer: selectedLayer, repo: repo) }
+                Result { try Git.compare(file, layer: selectedLayer, repo: repo, ignoresWhitespace: ignoresWhitespace) }
             }.value
             guard token == loadToken, !editing else { return }
             loading = false

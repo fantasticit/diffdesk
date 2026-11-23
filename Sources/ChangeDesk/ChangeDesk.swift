@@ -1,290 +1,548 @@
 import AppKit
 import SwiftUI
 
+// Use the property wrapper on Command Line Tools, where the newer State macro plugin isn't shipped.
+typealias DeskState<Value> = State<Value>
+
 @main
-struct ChangeDeskApp: App {
+struct DiffPlusApp: App {
     @StateObject private var workspace = Workspace()
 
     var body: some Scene {
-        Window("Diffdesk", id: "workspace") {
+        Window("diff+", id: "workspace") {
             DeskView(model: workspace)
-                .frame(minWidth: 850, minHeight: 490)
-                .ignoresSafeArea(.container, edges: .top)
+                .frame(minWidth: 930, minHeight: 510)
                 .task { workspace.start() }
         }
-        .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 1260, height: 760)
+        .windowToolbarStyle(.unified(showsTitle: false))
+        .defaultSize(width: 1300, height: 785)
         .commands {
+            SidebarCommands()
             CommandGroup(replacing: .newItem) {
                 Button("打开工作区…") { workspace.chooseDirectory() }
                     .keyboardShortcut("o")
+                    .disabled(workspace.busy)
+                Menu("最近的工作区") {
+                    ForEach(workspace.recentWorkspaces, id: \.self) { url in
+                        Button(url.path) { workspace.openRecent(url) }
+                            .disabled(url == workspace.directory)
+                    }
+                }
+                .disabled(workspace.recentWorkspaces.isEmpty || workspace.busy)
             }
             CommandGroup(after: .saveItem) {
                 Button("保存文件") { workspace.save() }
                     .keyboardShortcut("s")
-                    .disabled(!workspace.editing)
+                    .disabled(!workspace.hasDraft || workspace.busy)
                 Button("刷新工作区") { workspace.refresh() }
                     .keyboardShortcut("r")
                     .disabled(workspace.directory == nil)
+            }
+            CommandGroup(after: .toolbar) {
+                Button("筛选变更文件") {
+                    NotificationCenter.default.post(name: .showChangeSearch, object: nil)
+                }
+                .keyboardShortcut("f", modifiers: [.command, .shift])
+                .disabled(workspace.repo == nil)
+            }
+            CommandGroup(after: .pasteboard) {
+                Divider()
+                Button("在文件中搜索…") { FileSearchCommand.open.send() }
+                    .keyboardShortcut("f")
+                    .disabled(!workspace.hasSearchableText)
+                Button("下一个匹配") { FileSearchCommand.next.send() }
+                    .keyboardShortcut("g")
+                    .disabled(!workspace.hasSearchableText)
+                Button("上一个匹配") { FileSearchCommand.previous.send() }
+                    .keyboardShortcut("g", modifiers: [.command, .shift])
+                    .disabled(!workspace.hasSearchableText)
             }
         }
     }
 }
 
+extension Notification.Name {
+    static let showChangeSearch = Self("diffplus.showChangeSearch")
+    static let fileSearch = Self("diffplus.fileSearch")
+}
+
+private enum FileSearchCommand {
+    case open, next, previous
+
+    func send() {
+        NotificationCenter.default.post(name: .fileSearch, object: self)
+    }
+}
+
 struct DeskView: View {
     @ObservedObject var model: Workspace
-    @State private var baseSheet = false
-    @State private var baseText = ""
-    @State private var commitSheet = false
-    @State private var commitText = ""
-    @State private var commitPaths: [String] = []
-    @State private var commitState = Data()
-    @State private var commitHead: String?
-    @State private var preparingCommit = false
-    @State private var repoFilter = ""
-    @State private var directoryFilter = ""
-    @State private var expandedDirectories: Set<String> = []
-    @State private var collapsedSearchDirectories: Set<String> = []
-    @State private var changeScope: ChangeScope = .all
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @DeskState private var baseSheet = false
+    @DeskState private var baseText = ""
+    @DeskState private var commitSheet = false
+    @DeskState private var commitText = ""
+    @DeskState private var commitPaths: [String] = []
+    @DeskState private var commitState = Data()
+    @DeskState private var commitHead: String?
+    @DeskState private var preparingCommit = false
+    @DeskState private var repoFilter = ""
+    @DeskState private var directoryFilter = ""
+    @DeskState private var onlyChanged = false
+    @DeskState private var expandedDirectories: Set<String> = []
+    @DeskState private var collapsedSearchDirectories: Set<String> = []
+    @DeskState private var changeScope: ChangeScope = .all
+    @DeskState private var selection = NavigationSplitViewVisibility.all
+    @DeskState private var showOutline = false
+    @DeskState private var outlineSide = SourceSide.after
+    @DeskState private var viewport = TextViewport()
+    @DeskState private var textJump: TextJump?
+    @DeskState private var showFileSearch = false
+    @DeskState private var fileSearchQuery = ""
+    @DeskState private var fileSearchSide = SourceSide.after
+    @DeskState private var fileSearchResult: FileSearchResult?
+    @DeskState private var fileSearchSelection = 0
+    @DeskState private var fileSearchRevealID: UUID?
+    @FocusState private var search: SearchField?
+    @Environment(\.accessibilityReduceMotion) private var reducedMotion
 
+    private enum SearchField: Hashable { case repositories, files, code }
     private enum ChangeScope: String, CaseIterable {
         case all = "全部", work = "未提交", branch = "未合入"
+
+        var group: Group? {
+            switch self {
+            case .all: nil
+            case .work: .work
+            case .branch: .branch
+            }
+        }
     }
 
-    private var interaction: Animation? { reduceMotion ? nil : .easeOut(duration: 0.16) }
-    @FocusState private var focusedSearch: SearchField?
-
-    private enum SearchField: Hashable { case worktrees, changes }
-    @State private var hoveredRow: String?
-    @State private var sidebarVisible = true
-    private static let logo = NSImage(contentsOf: Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/Diffdesk.icns"))
-
     var body: some View {
-        VStack(spacing: 0) {
-            toolbar
-            Divider()
-            if model.directory == nil {
-                empty("选择工作区", icon: "folder", detail: "打开包含多个 Git 仓库的父目录。") {
-                    Button("打开文件夹…") { model.chooseDirectory() }
-                        .buttonStyle(.borderedProminent)
-                }
-            } else {
-                HStack(spacing: 0) {
-                    if sidebarVisible {
-                        repositories.frame(width: 190)
-                        DeskStyle.border.frame(width: 1)
-                    }
-                    files.frame(width: 244)
-                    DeskStyle.border.frame(width: 1)
-                    review.frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
+        let request = fileSearchRequest
+        NavigationSplitView(columnVisibility: $selection) {
+            repositories
+                .navigationSplitViewColumnWidth(min: 172, ideal: 222, max: 360)
+        } content: {
+            changesPane
+                .navigationSplitViewColumnWidth(min: 210, ideal: 254, max: 390)
+        } detail: {
+            VStack(spacing: 0) {
+                review
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if let message = model.issue { issueBanner(message) }
+                Divider()
+                statusBar
             }
-            if let issue = model.issue {
-                HStack(alignment: .top) {
-                    Label(issue, systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(.primary).textSelection(.enabled)
-                    Spacer()
-                    Button("关闭", systemImage: "xmark") { model.issue = nil }
-                        .labelStyle(.iconOnly).buttonStyle(.plain)
-                }
-                .font(.callout).padding(10)
-                .background(Color.orange.opacity(0.12))
-            }
-            Divider()
-            footer
+            .background(DeskStyle.canvas)
+            .navigationTitle(model.directory?.lastPathComponent ?? "diff+")
+            .toolbar { workspaceToolbar }
         }
-        .background(DeskStyle.content)
+        .navigationSplitViewStyle(.balanced)
         .tint(DeskStyle.accent)
-        .onChange(of: model.directory) { _, _ in
-            repoFilter = ""
-        }
+        .onChange(of: model.directory) { _, _ in repoFilter = "" }
         .onChange(of: model.repoID) { _, _ in
             changeScope = .all
             directoryFilter = ""
             expandedDirectories = parentFolders(of: model.file?.path)
             collapsedSearchDirectories = []
         }
-        .onChange(of: model.fileID, initial: true) { _, next in
-            if next != nil {
-                expandedDirectories.formUnion(parentFolders(of: model.file?.path))
+        .onChange(of: model.fileID, initial: true) { _, _ in
+            expandedDirectories.formUnion(parentFolders(of: model.file?.path))
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .showChangeSearch)) { _ in
+            if selection == .detailOnly { selection = .doubleColumn }
+            search = .files
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .fileSearch)) { notification in
+            switch notification.object as? FileSearchCommand {
+            case .open: openFileSearch()
+            case .next: stepFileSearch(1)
+            case .previous: stepFileSearch(-1)
+            case nil: break
             }
         }
+        .task(id: request) { await updateFileSearch(request) }
+        .onChange(of: model.layoutRevision) { _, _ in textJump = nil }
+        .onChange(of: model.fullVersion) { _, _ in textJump = nil }
+        .onChange(of: outlineSide) { _, _ in textJump = nil }
         .sheet(isPresented: $baseSheet) { baseEditor }
         .sheet(isPresented: $commitSheet) { commitEditor }
     }
 
-    private var toolbar: some View {
-        HStack(spacing: 9) {
-            if let logo = Self.logo {
-                Image(nsImage: logo).resizable().frame(width: 30, height: 30).accessibilityHidden(true)
+    private var searchesSingleDiffSide: Bool {
+        model.mode != .full && !(model.mode == .unified && model.comparison?.rows.isEmpty == false)
+    }
+
+    private var hasSearchableReview: Bool {
+        model.hasSearchableText && (changeScope.group == nil || model.file?.group == changeScope.group)
+    }
+
+    private var fileSearchRequest: FileSearchRequest? {
+        guard showFileSearch, hasSearchableReview, !fileSearchQuery.isEmpty,
+              let comparison = model.comparison else { return nil }
+        if model.mode == .full {
+            guard let text = model.editing ? model.draft : model.fullSnapshot?.text else { return nil }
+            return FileSearchRequest(query: fileSearchQuery, surface: .full, document: .text(text))
+        }
+        if !searchesSingleDiffSide {
+            return FileSearchRequest(query: fileSearchQuery, surface: .unified, document: .diff(comparison, .unified))
+        }
+        let before = comparison.left.text
+        let after = comparison.right.text
+        let left = before != nil && (fileSearchSide == .before || after == nil)
+        guard let text = left ? before : after else { return nil }
+        let surface: FileSearchSurface = left ? .before : .after
+        let document: FileSearchDocument = comparison.rows.isEmpty ? .text(text) : .diff(comparison, surface)
+        return FileSearchRequest(query: fileSearchQuery, surface: surface, document: document)
+    }
+
+    private var currentFileSearchResult: FileSearchResult? {
+        guard let result = fileSearchResult, result.request == fileSearchRequest else { return nil }
+        return result
+    }
+
+    private func openFileSearch() {
+        guard hasSearchableReview else { return }
+        showFileSearch = true
+        search = .code
+    }
+
+    private func closeFileSearch() {
+        showFileSearch = false
+        if search == .code { search = nil }
+    }
+
+    private func stepFileSearch(_ delta: Int) {
+        guard let count = currentFileSearchResult?.matches.count, count > 0 else { return }
+        fileSearchSelection = (fileSearchSelection + delta + count) % count
+        fileSearchRevealID = UUID()
+    }
+
+    private func updateFileSearch(_ request: FileSearchRequest?) async {
+        guard let request else {
+            fileSearchResult = nil
+            return
+        }
+        do {
+            try await Task.sleep(for: .milliseconds(90))
+            let worker = Task.detached(priority: .userInitiated) { try request.matches() }
+            let matches = try await withTaskCancellationHandler {
+                try await worker.value
+            } onCancel: {
+                worker.cancel()
             }
-            Text("Diffdesk").font(.system(size: 16, weight: .semibold)).foregroundStyle(DeskStyle.ink)
-            Rectangle().fill(DeskStyle.border).frame(width: 1, height: 22).padding(.horizontal, 4)
-            Button { model.chooseDirectory() } label: {
-                Label(model.directory?.lastPathComponent ?? "打开工作区", systemImage: "folder")
-            }
-            .buttonStyle(DeskButton())
-            .help(model.directory?.path ?? "打开工作区（⌘O）")
-            .accessibilityLabel("打开工作区")
-            .disabled(model.busy)
-            WindowDragArea().frame(minWidth: 16, maxWidth: .infinity)
-            if model.directory != nil {
-                Button { sidebarVisible.toggle() } label: {
-                    Image(systemName: "sidebar.left")
+            try Task.checkCancellation()
+            guard request == fileSearchRequest else { return }
+            let editingText = model.editing && search != .code
+                && fileSearchResult?.request.query.utf8.elementsEqual(request.query.utf8) == true
+            fileSearchSelection = editingText ? min(fileSearchSelection, max(0, matches.count - 1)) : 0
+            fileSearchRevealID = editingText ? nil : UUID()
+            fileSearchResult = FileSearchResult(request: request, matches: matches)
+        } catch is CancellationError {
+            return
+        } catch {
+            fileSearchResult = nil
+        }
+    }
+
+    private var fileSearchMarks: (surface: FileSearchSurface, marks: FileSearchMarks)? {
+        guard let result = currentFileSearchResult, result.matches.indices.contains(fileSearchSelection) else { return nil }
+        return (result.request.surface,
+                FileSearchMarks(result: result, selection: fileSearchSelection, revealID: fileSearchRevealID))
+    }
+
+    private var fileSearchBar: some View {
+        let result = currentFileSearchResult
+        let hasMatches = result?.matches.isEmpty == false
+        return HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").foregroundStyle(.secondary).accessibilityHidden(true)
+            TextField("在文件中搜索", text: $fileSearchQuery)
+                .textFieldStyle(.roundedBorder)
+                .focused($search, equals: .code)
+                .onSubmit { stepFileSearch(1) }
+                .onAppear { search = .code }
+                .frame(minWidth: 96, maxWidth: 340)
+            if searchesSingleDiffSide, model.comparison?.left.text != nil, model.comparison?.right.text != nil {
+                Picker("搜索范围", selection: $fileSearchSide) {
+                    ForEach(SourceSide.allCases) { Text($0.rawValue).tag($0) }
                 }
-                .buttonStyle(DeskButton())
-                .help(sidebarVisible ? "隐藏工作树" : "显示工作树")
-                .accessibilityLabel(sidebarVisible ? "隐藏工作树" : "显示工作树")
+                .labelsHidden().fixedSize()
             }
-            if model.scanning || model.busy {
-                ProgressView().controlSize(.small)
-                    .accessibilityLabel(model.busy ? "正在运行 Git 操作" : "正在扫描工作区")
+            Spacer(minLength: 0)
+            if !model.hasSearchableText {
+                Text(model.loading ? "正在加载文件…" : "此版本无可搜索文本")
+            } else if !fileSearchQuery.isEmpty {
+                if let result {
+                    if hasMatches {
+                        Text("\((fileSearchSelection + 1).formatted()) / \(result.matches.count.formatted())")
+                            .accessibilityLabel("第 \(fileSearchSelection + 1) 个匹配，共 \(result.matches.count) 个")
+                    } else {
+                        Text("无匹配")
+                    }
+                } else {
+                    ProgressView().controlSize(.mini).accessibilityLabel("正在搜索")
+                }
             }
-            Button { model.refresh() } label: {
-                Label("刷新工作区", systemImage: "arrow.clockwise").labelStyle(.iconOnly)
-            }.buttonStyle(DeskButton()).help("刷新（⌘R）").disabled(model.directory == nil || model.scanning || model.busy)
+            Button("上一个匹配", systemImage: "chevron.up") { stepFileSearch(-1) }
+                .help("上一个匹配（⇧⌘G）").disabled(!hasMatches)
+            Button("下一个匹配", systemImage: "chevron.down") { stepFileSearch(1) }
+                .help("下一个匹配（⌘G）").disabled(!hasMatches)
+            Button("关闭文件内搜索", systemImage: "xmark", action: closeFileSearch)
+                .help("关闭搜索（Esc）")
+        }
+        .labelStyle(.iconOnly)
+        .buttonStyle(.borderless)
+        .controlSize(.small)
+        .font(.callout.monospacedDigit())
+        .padding(.horizontal, 13)
+        .frame(height: 37)
+        .background(DeskStyle.panel)
+        .onExitCommand(perform: closeFileSearch)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("文件内搜索")
+    }
+
+    @ToolbarContentBuilder private var workspaceToolbar: some ToolbarContent {
+        ToolbarItemGroup(placement: .navigation) {
+            Button(action: model.chooseDirectory) { Label("打开工作区", systemImage: "folder") }
+                .help("打开工作区（⌘O）")
+                .disabled(model.busy)
+            Button { model.refresh() } label: { Label("刷新", systemImage: "arrow.clockwise") }
+                .help("刷新工作区（⌘R）")
+                .disabled(model.directory == nil || model.scanning || model.busy)
+        }
+        ToolbarItemGroup(placement: .primaryAction) {
             Menu {
-                Button("设置对比基准…", systemImage: "point.topleft.down.to.point.bottomright.curvepath") {
+                Button("在 Finder 中显示工作树") {
+                    if let repo = model.repo { NSWorkspace.shared.activateFileViewerSelecting([repo.url]) }
+                }
+                Button("设置对比基准…") {
                     if let repo = model.repo { baseText = model.priorBase(for: repo.url) ?? "" }
                     baseSheet = true
                 }
-                Button("更新远端引用（Fetch）", systemImage: "arrow.down.circle") { model.fetch() }
+                Button("更新远端引用（Fetch）") { model.fetch() }
                 Divider()
-                Button("提交暂存区…", systemImage: "checkmark.circle") { prepareCommit() }.disabled(preparingCommit)
-            } label: { Label("仓库操作", systemImage: "ellipsis.circle").labelStyle(.iconOnly) }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
+                Button("提交暂存区…", action: prepareCommit).disabled(preparingCommit)
+            } label: {
+                Label("仓库操作", systemImage: "ellipsis")
+            }
+            .help("仓库操作")
             .disabled(model.repo == nil || model.busy || model.repo?.issue != nil)
         }
-        .padding(.leading, 82)
-        .padding(.trailing, 13)
-        .frame(height: 42)
-        .background(DeskStyle.panel)
     }
 
     private var repositories: some View {
         let query = SearchQuery(repoFilter)
-        let repos = query.ranked(model.repos) { query.score($0, relativePath: model.relative($0.url)) }
+        let candidates = model.repos.filter { !onlyChanged || !$0.changes.isEmpty || $0.issue != nil || $0.pending }
+        let visible = query.ranked(candidates) { query.score($0, relativePath: model.relative($0.url)) }
+        let selected = Binding<URL?>(
+            get: { model.repoID },
+            set: { if let id = $0 { model.chooseRepo(id) } }
+        )
         return VStack(spacing: 0) {
-            sectionHeader("工作树", icon: "square.stack.3d.up", count: repos.count)
-            searchField("搜索工作树、分支或路径", text: $repoFilter, field: .worktrees) {
-                if let first = repos.first { selectWorktree(first.id) }
+            searchField("筛选工作树", text: $repoFilter, field: .repositories) {
+                if let first = visible.first { model.chooseRepo(first.id) }
             }
-            if repos.isEmpty {
-                Text(model.scanning ? "扫描目录中…" : query.isEmpty ? "未找到 Git 工作树" : "没有匹配的工作树")
-                    .font(.callout).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 3) {
-                        ForEach(repos) { repo in
-                            let work = repo.pending ? "…" : String(repo.changes.lazy.filter { $0.group == .work }.count)
-                            let branch = repo.pending ? "…" : repo.ancestor == nil ? "—" : String(repo.changes.lazy.filter { $0.group == .branch }.count)
-                            row(key: repo.url.path, selected: repo.id == model.repoID, action: { selectWorktree(repo.id) }) {
-                                HStack(alignment: .top, spacing: 9) {
-                                    Image(systemName: "shippingbox").font(.system(size: 12, weight: .semibold))
-                                        .foregroundStyle(repo.id == model.repoID ? DeskStyle.accent : .secondary)
-                                        .frame(width: 16, height: 17)
-                                        .accessibilityHidden(true)
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text(repo.url.lastPathComponent).font(.system(size: 13, weight: .semibold)).lineLimit(1)
-                                        Text(repo.branch).font(.system(size: 11)).lineLimit(1).foregroundStyle(.secondary)
-                                        if !query.isEmpty {
-                                            Text(model.relative(repo.url)).font(.system(size: 10))
-                                                .lineLimit(1).truncationMode(.head).foregroundStyle(.secondary)
-                                        }
-                                        HStack(spacing: 12) {
-                                            countMark(work, icon: "square.and.pencil", label: "未提交")
-                                            countMark(branch, icon: "arrow.triangle.branch", label: "已提交未合入")
-                                        }.padding(.top, 2)
-                                    }
-                                }
-                            }
-                            .overlay(alignment: .leading) {
-                                Capsule().fill(DeskStyle.accent).frame(width: 2, height: 24)
-                                    .opacity(repo.id == model.repoID ? 1 : 0)
-                                    .animation(interaction, value: repo.id == model.repoID)
-                                    .allowsHitTesting(false)
-                            }
+            List(selection: selected) {
+                Section {
+                    ForEach(visible) { repo in
+                        repoLabel(repo, showPath: !query.isEmpty)
+                            .tag(repo.id)
                             .help(model.relative(repo.url))
-                        }
-                    }.padding(.horizontal, 8).padding(.bottom, 8)
+                    }
+                } header: {
+                    HStack {
+                        Text("工作树")
+                        Spacer()
+                        Text(visible.count.formatted()).monospacedDigit()
+                    }
                 }
             }
+            .listStyle(.sidebar)
+            .overlay {
+                if visible.isEmpty {
+                    if model.scanning {
+                        ProgressView("正在扫描…").controlSize(.small)
+                    } else {
+                        Text(model.directory == nil ? "打开工作区后显示工作树" :
+                                (query.isEmpty && !onlyChanged ? "未找到 Git 工作树" : "没有匹配的工作树"))
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding()
+                    }
+                }
+            }
+            Toggle("只看有变更", isOn: $onlyChanged)
+                .toggleStyle(.checkbox)
+                .font(.callout)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .disabled(model.directory == nil)
         }
-        .frame(maxHeight: .infinity)
-        .background(DeskStyle.panel)
     }
 
-    private func countMark(_ count: String, icon: String, label: String) -> some View {
-        Label(count, systemImage: icon)
-            .font(.system(size: 10, weight: .medium).monospacedDigit())
-            .foregroundStyle(.secondary)
-            .help(label).accessibilityLabel(label+" "+count)
-    }
-
-    private func selectWorktree(_ id: URL) {
-        model.chooseRepo(id)
-    }
-
-    private func searchField(_ prompt: String, text: Binding<String>, field: SearchField, onSubmit: @escaping () -> Void) -> some View {
-        HStack(spacing: 7) {
-            Image(systemName: "magnifyingglass").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+    private func repoLabel(_ repo: Worktree, showPath: Bool) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: repo.issue == nil ? "square.stack.3d.up" : "exclamationmark.triangle")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(repo.issue == nil ? DeskStyle.accent : .orange)
+                .frame(width: 19, height: 18)
                 .accessibilityHidden(true)
-            TextField(prompt, text: text)
-                .textFieldStyle(.plain).font(.system(size: 12))
-                .accessibilityLabel(prompt)
-                .focused($focusedSearch, equals: field)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(repo.url.lastPathComponent)
+                    .font(.system(size: 13, weight: .medium))
+                    .lineLimit(1).truncationMode(.middle)
+                Text(repo.branch)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle)
+                if showPath {
+                    Text(model.relative(repo.url))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.head)
+                }
+            }
+            Spacer(minLength: 4)
+            if repo.pending {
+                ProgressView().controlSize(.mini).accessibilityLabel("读取状态中")
+            } else if !repo.changes.isEmpty {
+                Text(repo.changes.count.formatted())
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("\(repo.changes.count) 项变更")
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func searchField(
+        _ title: String, text: Binding<String>, field: SearchField, onSubmit: @escaping () -> Void
+    ) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            TextField(title, text: text)
+                .textFieldStyle(.plain)
+                .focused($search, equals: field)
                 .onSubmit(onSubmit)
-                .onExitCommand { if !text.wrappedValue.isEmpty { text.wrappedValue = "" } }
+                .onExitCommand { text.wrappedValue = "" }
             if !text.wrappedValue.isEmpty {
                 Button("清除筛选", systemImage: "xmark.circle.fill") {
                     text.wrappedValue = ""
-                    focusedSearch = field
+                    search = field
                 }
-                .labelStyle(.iconOnly).buttonStyle(.plain).foregroundStyle(.secondary)
+                .labelStyle(.iconOnly)
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
             }
         }
-        .padding(.horizontal, 9).frame(height: 29)
-        .background(DeskStyle.content, in: RoundedRectangle(cornerRadius: 6))
+        .font(.callout)
+        .padding(.horizontal, 9)
+        .frame(height: 28)
+        .background(.quaternary.opacity(0.5), in: .rect(cornerRadius: 7))
         .overlay {
-            RoundedRectangle(cornerRadius: 6)
-                .strokeBorder(focusedSearch == field ? DeskStyle.accent : DeskStyle.border)
-                .allowsHitTesting(false)
+            if search == field {
+                RoundedRectangle(cornerRadius: 7).strokeBorder(DeskStyle.accent)
+                    .allowsHitTesting(false)
+            }
         }
-        .padding(.horizontal, 10).padding(.bottom, 9)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
     }
 
-    private var files: some View {
+    private var changesPane: some View {
         let changes = model.repo?.changes ?? []
-        let working = changes.filter { $0.group == .work }
-        let committed = changes.filter { $0.group == .branch }
-        let filtered = changeScope == .all ? changes : changeScope == .work ? working : committed
+        let filtered = changes.filter { changeScope.group == nil || $0.group == changeScope.group }
+        let query = SearchQuery(directoryFilter)
+        let rows = ChangeFileTree(changes: filtered, query: query).rows { isExpanded($0, query: query) }
+        let selected = Binding<String?>(
+            get: { model.fileID },
+            set: { next in
+                if let file = filtered.first(where: { $0.id == next }) { model.chooseFile(file) }
+            }
+        )
         return VStack(spacing: 0) {
-            HStack {
-                Text("变更").font(.system(size: 13, weight: .semibold))
+            HStack(alignment: .firstTextBaseline) {
+                Text("变更").font(.headline).accessibilityAddTraits(.isHeader)
                 Spacer()
-                if model.repo?.pending != true {
-                    Text("\(Set(changes.map(\.path)).count) 个文件").monospacedDigit()
-                        .font(.caption).foregroundStyle(.secondary)
+                if model.repo?.pending == false {
+                    Text("\(Set(filtered.map(\.path)).count) 个文件")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
                 }
             }
-            .padding(.horizontal, 12).padding(.vertical, 9)
-            directoryBrowser(filtered, counts: [changes.count, working.count, committed.count])
-            Spacer(minLength: 0)
+            .padding(.horizontal, 14)
+            .padding(.top, 12)
+
+            searchField("筛选目录或文件", text: $directoryFilter, field: .files) {
+                for row in rows {
+                    if case let .file(file) = row.item { model.chooseFile(file); break }
+                }
+            }
+            .onChange(of: directoryFilter) { _, _ in collapsedSearchDirectories = [] }
+
+            Picker("变更范围", selection: Binding(get: { changeScope }, set: selectScope)) {
+                ForEach(ChangeScope.allCases, id: \.self) { scope in
+                    let count = changes.lazy.filter { scope.group == nil || $0.group == scope.group }.count
+                    let indicator = model.repo?.pending == true ? "…" :
+                        scope == .branch && model.repo?.ancestor == nil ? "—" : count.formatted()
+                    Text("\(scope.rawValue) \(indicator)").tag(scope)
+                }
+            }
+            .pickerStyle(.segmented).labelsHidden()
+            .disabled(model.repo == nil)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 9)
+
+            Divider()
+            if rows.isEmpty {
+                listEmpty(query: query)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(selection: selected) {
+                    ForEach(rows) { entry in treeRow(entry, query: query) }
+                }
+                .listStyle(.inset(alternatesRowBackgrounds: false))
+            }
             if let repo = model.repo {
                 Divider()
-                Label(repo.base.map { "相对 "+$0+" · 本地引用" } ?? "对比基准未设置",
-                      systemImage: "arrow.triangle.branch")
-                    .font(.caption).foregroundStyle(.secondary)
+                Label(repo.base.map { "基准  " + $0 } ?? "没有可用基准", systemImage: "point.topleft.down.to.point.bottomright.curvepath")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 11).padding(.vertical, 7)
+                    .padding(.horizontal, 13).padding(.vertical, 8)
             }
         }
-        .frame(maxHeight: .infinity, alignment: .top)
-        .background(DeskStyle.sidebar)
+        .background(DeskStyle.panel)
+    }
+
+    @ViewBuilder private func listEmpty(query: SearchQuery) -> some View {
+        if model.repo?.pending == true {
+            ProgressView("正在读取状态…").controlSize(.small)
+        } else {
+            let message = model.repo == nil ? "选择工作树" :
+                !query.isEmpty ? "没有匹配的文件" :
+                changeScope == .branch && model.repo?.ancestor == nil ? "没有可用的对比基准" : "没有变更文件"
+            Text(message).font(.callout).foregroundStyle(.secondary).padding()
+        }
+    }
+
+    private func selectScope(_ scope: ChangeScope) {
+        guard scope != changeScope else { return }
+        if let group = scope.group, model.file?.group != group {
+            if let next = model.repo?.changes.first(where: { $0.group == group }) {
+                model.chooseFile(next)
+                guard model.fileID == next.id else { return }
+            } else if model.editing, !model.leaveEditor() {
+                return
+            }
+        }
+        changeScope = scope
     }
 
     private func parentFolders(of file: String?) -> Set<String> {
@@ -298,297 +556,302 @@ struct DeskView: View {
         return result
     }
 
-    private func directoryBrowser(_ changes: [Change], counts: [Int]) -> some View {
-        let query = SearchQuery(directoryFilter)
-        let rows = ChangeFileTree(changes: changes, query: query).rows { isExpanded($0, query: query) }
-
-        return VStack(spacing: 0) {
-            searchField("搜索目录或文件", text: $directoryFilter, field: .changes) {
-                for entry in rows {
-                    if case .file(let file) = entry.item {
-                        model.chooseFile(file)
-                        break
-                    }
-                }
-            }
-            .onChange(of: directoryFilter) { _, _ in collapsedSearchDirectories = [] }
-
-            HStack(spacing: 3) {
-                ForEach(Array(ChangeScope.allCases.enumerated()), id: \.element) { index, scope in
-                    let count = counts[index]
-                    let label = model.repo?.pending == true ? "…" : scope == .branch && model.repo?.ancestor == nil ? "—" : String(count)
-                    Button {
-                        guard changeScope != scope else { return }
-                        withAnimation(interaction) { changeScope = scope }
-                        if scope != .all, let group = model.file?.group,
-                           group != (scope == .work ? .work : .branch),
-                           let next = model.repo?.changes.first(where: {
-                               $0.group == (scope == .work ? .work : .branch)
-                           }) {
-                            model.chooseFile(next)
-                        }
-                    } label: {
-                        Text(scope.rawValue + " " + label)
-                            .font(.system(size: 11, weight: .medium).monospacedDigit())
-                            .frame(maxWidth: .infinity).frame(height: 25)
-                            .background(changeScope == scope ? DeskStyle.selected : .clear,
-                                        in: RoundedRectangle(cornerRadius: 6))
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityAddTraits(changeScope == scope ? .isSelected : [])
-                }
-            }.padding(.horizontal, 9).padding(.bottom, 8)
-
-            if rows.isEmpty {
-                if model.repo?.pending == true {
-                    secondary("正在读取状态…")
-                } else if model.repo == nil {
-                    secondary("选择工作树")
-                } else {
-                    secondary(changeScope == .branch && model.repo?.ancestor == nil
-                              ? "没有可用的对比基准" : query.isEmpty ? "没有变更文件" : "没有匹配结果")
-                }
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 1) {
-                        ForEach(rows) { entry in
-                            treeRow(entry, query: query)
-                                .transition(reduceMotion ? .identity : .opacity)
-                        }
-                    }.padding(.horizontal, 6).padding(.bottom, 5)
-                }
-            }
-        }
-    }
-
     private func isExpanded(_ path: String, query: SearchQuery) -> Bool {
         query.isEmpty ? expandedDirectories.contains(path) : !collapsedSearchDirectories.contains(path)
     }
 
     @ViewBuilder private func treeRow(_ entry: ChangeFileTree.Entry, query: SearchQuery) -> some View {
-        let indent = CGFloat(min(entry.depth, 8)) * 12
+        let indent = CGFloat(min(entry.depth, 8)) * 10
         switch entry.item {
         case .folder(let path, let count):
             let expanded = isExpanded(path, query: query)
-            row(key: entry.id, selected: false, action: {
-                withAnimation(interaction) {
+            Button {
+                withAnimation(reducedMotion ? nil : .easeOut(duration: 0.14)) {
                     if query.isEmpty {
                         if expanded { expandedDirectories.remove(path) } else { expandedDirectories.insert(path) }
                     } else {
                         if expanded { collapsedSearchDirectories.insert(path) } else { collapsedSearchDirectories.remove(path) }
                     }
                 }
-            }) {
-                HStack(spacing: 7) {
-                    Image(systemName: "chevron.right")
-                        .rotationEffect(.degrees(expanded ? 90 : 0))
-                        .font(.system(size: 9, weight: .semibold)).frame(width: 9)
-                        .foregroundStyle(.secondary).accessibilityHidden(true)
-                    Image(systemName: expanded ? "folder.fill" : "folder")
-                        .foregroundStyle(DeskStyle.accent).accessibilityHidden(true)
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .frame(width: 10).foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+                    Image(systemName: "folder")
+                        .foregroundStyle(DeskStyle.accent)
+                        .accessibilityHidden(true)
                     Text((path as NSString).lastPathComponent).lineLimit(1).truncationMode(.middle)
-                    Spacer(minLength: 2)
-                    Text(String(count)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    Spacer(minLength: 3)
+                    Text(count.formatted()).monospacedDigit().foregroundStyle(.secondary).font(.caption)
                 }
-                .font(.system(size: 12, weight: .medium))
                 .padding(.leading, indent)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
             .help(path)
             .accessibilityValue(expanded ? "已展开" : "已折叠")
         case .file(let file):
             let kind = PreviewKind(path: file.path)
-            row(key: entry.id, selected: model.fileID == file.id, action: { model.chooseFile(file) }) {
-                HStack(spacing: 7) {
-                    Image(systemName: kind.symbol).foregroundStyle(kind.tint)
-                        .frame(width: 16).accessibilityHidden(true)
-                    Text((file.path as NSString).lastPathComponent)
-                        .lineLimit(1).truncationMode(.middle)
-                    Spacer(minLength: 2)
-                    Image(systemName: file.group == .work ? "square.and.pencil" : "arrow.triangle.branch")
-                        .font(.system(size: 9)).foregroundStyle(.secondary)
-                        .accessibilityLabel(file.group.rawValue)
-                    Text(file.status.replacingOccurrences(of: ".", with: ""))
-                        .font(.system(size: 10, weight: .semibold).monospaced())
-                        .foregroundStyle(statusColor(file))
-                        .lineLimit(1)
-                }
-                .font(.system(size: 12, weight: .medium))
-                .padding(.leading, indent + 16)
+            HStack(spacing: 7) {
+                Image(systemName: kind.symbol).foregroundStyle(kind.tint)
+                    .frame(width: 17).accessibilityHidden(true)
+                Text((file.path as NSString).lastPathComponent)
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 2)
+                Image(systemName: file.group == .work ? "square.and.pencil" : "arrow.triangle.branch")
+                    .font(.system(size: 9)).foregroundStyle(.secondary)
+                    .accessibilityLabel(file.group.rawValue)
+                Text(file.status.replacingOccurrences(of: ".", with: ""))
+                    .font(.caption.monospaced().weight(.semibold))
+                    .foregroundStyle(file.status.contains("D") ? DeskStyle.removed : file.status.contains("A") || file.status == "?" ? DeskStyle.added : .secondary)
             }
+            .padding(.leading, indent + 14)
+            .contentShape(Rectangle())
+            .tag(file.id)
             .help(file.group.rawValue + " · " + (file.oldPath.map { $0 + " → " + file.path } ?? file.path))
+            .contextMenu {
+                Button("复制相对路径") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(file.path, forType: .string)
+                }
+            }
         }
     }
 
     @ViewBuilder private var review: some View {
-        if let file = model.file {
+        if model.directory == nil {
+            ContentUnavailableView {
+                Label("打开工作区", systemImage: "folder.badge.gearshape")
+            } description: {
+                Text("选择 Git 工作树或包含多个工作树的文件夹。")
+            } actions: {
+                Button("打开文件夹…", action: model.chooseDirectory)
+                    .buttonStyle(.borderedProminent)
+            }
+        } else if let issue = model.repo?.issue {
+            ContentUnavailableView("无法读取工作树", systemImage: "exclamationmark.triangle", description: Text(issue))
+        } else if let file = model.file, changeScope.group == nil || file.group == changeScope.group {
             VStack(spacing: 0) {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        let kind = PreviewKind(path: file.path)
-                        Image(systemName: kind.symbol).foregroundStyle(kind.tint)
-                            .font(.system(size: 17, weight: .medium)).frame(width: 24)
-                            .accessibilityHidden(true)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text((file.path as NSString).lastPathComponent)
-                                .font(.system(size: 17, weight: .semibold)).lineLimit(1).truncationMode(.middle)
-                            Text((file.path as NSString).deletingLastPathComponent.isEmpty
-                                 ? model.repo?.url.lastPathComponent ?? ""
-                                 : (file.path as NSString).deletingLastPathComponent)
-                                .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
-                        }.help(file.path)
-                        Spacer()
-                        Picker("显示方式", selection: Binding(get: { model.mode }, set: model.changeMode)) {
-                            ForEach(Workspace.Mode.allCases, id: \.self) { mode in
-                                Label(mode.rawValue, systemImage: mode == .compare ? "rectangle.split.2x1" : "doc")
-                                    .tag(mode)
-                            }
-                        }.labelsHidden().pickerStyle(.segmented).fixedSize()
-                    }
-                    HStack(spacing: 8) {
-                        if file.layers.count > 1 {
-                            Picker("Git 状态", selection: Binding(get: { model.layer }, set: model.chooseLayer)) {
-                                ForEach(file.layers) { Text($0.rawValue).tag($0) }
-                            }.labelsHidden().fixedSize()
-                        } else {
-                            Text(model.layer.rawValue).foregroundStyle(.secondary)
-                        }
-                        Spacer(minLength: 2)
-                        if model.editing {
-                            Button("保存", systemImage: "checkmark") { model.save() }.buttonStyle(DeskButton(emphasized: true)).disabled(!model.hasDraft)
-                        } else {
-                            if file.group == .work {
-                                if file.layers.contains(.index) {
-                                    Button("取消暂存", systemImage: "minus.circle") { model.stage(true) }.buttonStyle(DeskButton()).disabled(model.busy)
-                                }
-                                if file.layers.contains(where: { $0 != .index }) {
-                                    Button("暂存", systemImage: "plus.circle") { model.stage(false) }.buttonStyle(DeskButton()).disabled(model.busy)
-                                }
-                            }
-                            if model.canEdit {
-                                Button("编辑", systemImage: "pencil") { model.beginEditing() }
-                                    .buttonStyle(DeskButton()).help("编辑工作区文件")
-                                    .disabled(model.loading || model.busy)
-                            }
-                        }
-                    }.font(.caption)
-                }.padding(.horizontal, 16).padding(.vertical, 11).background(DeskStyle.panel)
+                reviewHeader(file)
                 Divider()
+                if showFileSearch {
+                    fileSearchBar
+                    Divider()
+                }
                 if let comparison = model.comparison {
-                    SwiftUI.Group {
-                        if model.mode == .compare {
-                            SplitComparison(comparison: comparison, path: file.path).id(model.layoutRevision)
-                        } else {
-                            fullFile(comparison)
-                        }
-                    }
-                    .modifier(PreviewFeedback(revision: model.layoutRevision, mode: model.mode))
+                    documentReview(file, comparison: comparison)
                 } else if let issue = model.fileIssue {
-                    empty("无法读取文件", icon: "exclamationmark.triangle", detail: issue) {
+                    ContentUnavailableView {
+                        Label("无法读取文件", systemImage: "exclamationmark.triangle")
+                    } description: {
+                        Text(issue).textSelection(.enabled)
+                    } actions: {
                         Button("重试") { model.loadFile() }
                     }
                 } else {
                     ProgressView("加载文件…").frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
-        } else if model.repo?.pending == true {
+        } else if model.repo?.pending == true || model.repo == nil && model.scanning {
             ProgressView("正在读取工作树…").frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if let issue = model.repo?.issue {
-            empty("无法读取工作树", icon: "exclamationmark.triangle", detail: issue) {}
         } else {
-            empty("选择变更文件", icon: "doc.text.magnifyingglass", detail: "可查看完整文件，或左右对比不同版本。") {}
+            ContentUnavailableView(model.repo == nil ? "选择工作树" : "选择变更文件",
+                                   systemImage: "rectangle.split.2x1")
         }
+    }
+
+    private func source(_ file: Change, comparison: Comparison) -> OutlineSource? {
+        if model.mode == .full {
+            let text = model.editing ? model.draft : model.fullSnapshot?.text
+            let side: SourceSide = model.fullVersion == .left ? .before : .after
+            return text.map { OutlineSource(path: file.path, text: $0, side: side) }
+        }
+        let right = comparison.right.text
+        let left = comparison.left.text
+        if let left, (outlineSide == .before || right == nil) {
+            return OutlineSource(path: file.oldPath ?? file.path, text: left, side: .before)
+        }
+        return right.map { OutlineSource(path: file.path, text: $0, side: .after) }
+    }
+
+    @ViewBuilder private func documentReview(_ file: Change, comparison: Comparison) -> some View {
+        if let source = source(file, comparison: comparison) {
+            DocumentNavigator(source: source, comparison: model.mode == .full ? nil : comparison,
+                              unified: model.mode == .unified,
+                              canSwitchSide: model.mode != .full && comparison.left.text != nil && comparison.right.text != nil,
+                              side: $outlineSide, showOutline: $showOutline, viewport: viewport,
+                              jump: { textJump = TextJump(target: $0) }) {
+                documentBody(file, comparison: comparison, side: source.side)
+            }
+        } else {
+            documentBody(file, comparison: comparison, side: .after)
+        }
+    }
+
+    @ViewBuilder private func documentBody(_ file: Change, comparison: Comparison, side: SourceSide) -> some View {
+        if model.mode == .full {
+            fullFile(comparison)
+        } else {
+            DifferenceView(comparison: comparison, path: file.path, unified: model.mode == .unified,
+                           sourceSide: side, viewport: viewport, jump: textJump,
+                           searchMarks: fileSearchMarks,
+                           isLoading: model.loading, whitespaceDisabled: model.busy,
+                           setIgnoresWhitespace: model.setIgnoresWhitespace)
+                .id(model.layoutRevision)
+        }
+    }
+
+    private func reviewHeader(_ file: Change) -> some View {
+        VStack(alignment: .leading, spacing: 11) {
+            HStack(alignment: .center, spacing: 11) {
+                let kind = PreviewKind(path: file.path)
+                Image(systemName: kind.symbol).foregroundStyle(kind.tint)
+                    .font(.system(size: 21, weight: .medium))
+                    .frame(width: 28)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text((file.path as NSString).lastPathComponent)
+                        .font(.title3.weight(.semibold))
+                        .lineLimit(1).truncationMode(.middle)
+                        .accessibilityAddTraits(.isHeader)
+                    Text(file.path)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
+                .help(file.oldPath.map { "\($0) → \(file.path)" } ?? file.path)
+                Spacer(minLength: 8)
+                Picker("审阅布局", selection: Binding(get: { model.mode }, set: { mode in
+                    let previous = model.mode
+                    model.changeMode(mode)
+                    if previous != model.mode { textJump = nil }
+                })) {
+                    ForEach(Workspace.Mode.allCases, id: \.self) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .labelsHidden().pickerStyle(.segmented).fixedSize()
+
+                Button("在文件中搜索", systemImage: "magnifyingglass", action: openFileSearch)
+                    .labelStyle(.iconOnly)
+                    .controlSize(.small)
+                    .help("在文件中搜索（⌘F）")
+                    .disabled(!model.hasSearchableText)
+
+                Toggle("大纲", systemImage: "list.bullet.indent", isOn: $showOutline)
+                    .toggleStyle(.button)
+                    .controlSize(.small)
+                    .keyboardShortcut("o", modifiers: [.command, .shift])
+                    .help("显示或隐藏文件大纲（⇧⌘O）")
+                    .disabled(model.comparison.flatMap { source(file, comparison: $0) } == nil)
+            }
+
+            HStack(spacing: 9) {
+                if file.layers.count > 1 && !model.editing {
+                    Picker("Git 状态", selection: Binding(get: { model.layer }, set: model.chooseLayer)) {
+                        ForEach(file.layers) { Text($0.rawValue).tag($0) }
+                    }
+                    .labelsHidden().fixedSize()
+                } else {
+                    Label(model.editing ? "正在编辑工作区" : model.layer.rawValue,
+                          systemImage: model.editing ? "pencil" : "circle.lefthalf.filled")
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 6)
+                if model.editing {
+                    Button("取消") { if model.leaveEditor() { model.changeMode(.compare) } }
+                        .disabled(model.busy)
+                    Button("保存", systemImage: "checkmark", action: model.save)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!model.hasDraft || model.busy)
+                } else {
+                    Button("编辑", systemImage: "pencil", action: model.beginEditing)
+                        .help("编辑工作区文件")
+                        .disabled(!model.canEdit || model.loading || model.busy)
+                    if file.group == .work {
+                        if file.layers.contains(.index) {
+                            Button("取消暂存") { model.stage(true) }.disabled(model.busy)
+                        }
+                        if file.layers.contains(where: { $0 != .index }) {
+                            Button("暂存", systemImage: "plus") { model.stage(false) }
+                                .disabled(model.busy)
+                        }
+                    }
+                }
+            }
+            .controlSize(.small)
+            .font(.callout)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(DeskStyle.panel)
     }
 
     private func fullFile(_ comparison: Comparison) -> some View {
         VStack(spacing: 0) {
-            HStack {
-                if model.editing {
-                    Label("正在编辑工作区", systemImage: "pencil")
-                } else {
-                    Picker("版本", selection: $model.fullVersion) {
+            if !model.editing {
+                HStack {
+                    Picker("文件版本", selection: $model.fullVersion) {
                         Text(comparison.left.label).tag(Workspace.FullVersion.left)
                         Text(comparison.right.label).tag(Workspace.FullVersion.right)
                         if comparison.right.label != "工作区" { Text("工作区").tag(Workspace.FullVersion.disk) }
-                    }.labelsHidden().fixedSize()
+                    }
+                    .controlSize(.small)
+                    .fixedSize()
+                    Spacer()
                 }
-                Spacer()
-            }.font(.caption).padding(8).background(DeskStyle.panel)
-            Divider()
+                .padding(.horizontal, 14).padding(.vertical, 7)
+                .background(DeskStyle.panel)
+                Divider()
+            }
             if model.editing {
-                NativeText(text: model.draft, editable: true) { model.draft = $0 }
+                NativeText(text: model.draft, editable: true, viewport: viewport, jump: textJump,
+                           searchMarks: fileSearchMarks?.marks) { model.draft = $0 }
                     .id(model.layoutRevision)
             } else if let snapshot = model.fullSnapshot, let file = model.file {
-                FilePreview(snapshot: snapshot, path: file.path)
+                FilePreview(snapshot: snapshot, path: file.path, viewport: viewport, jump: textJump,
+                            searchMarks: fileSearchMarks?.marks)
                     .id(model.fullVersion)
             }
         }
     }
 
-    private var footer: some View {
-        HStack {
-            if let notice = model.notice {
-                Text(notice).lineLimit(1)
-            } else if model.directory != nil {
-                Text(model.scanning ? "扫描中…" : "\(model.repos.count) 个工作树")
+    private func issueBanner(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
+            Text(message).textSelection(.enabled)
+            Spacer()
+            Button("关闭提示", systemImage: "xmark") { model.issue = nil }
+                .labelStyle(.iconOnly).buttonStyle(.borderless)
+        }
+        .font(.callout)
+        .padding(12)
+        .background(.orange.opacity(0.12))
+    }
+
+    private var statusBar: some View {
+        HStack(spacing: 9) {
+            if model.busy || model.scanning {
+                ProgressView().controlSize(.mini)
+                Text(model.busy ? "正在运行 Git 操作…" : "正在扫描工作区…")
             } else {
-                Text("本地工作区")
+                Text(model.notice ?? "\(model.repos.count) 个工作树").lineLimit(1)
             }
-            Spacer()
-            if let file = model.file {
-                Text(file.path).lineLimit(1).truncationMode(.middle).help(file.path)
+            Spacer(minLength: 8)
+            if let repo = model.repo {
+                Label(repo.branch, systemImage: "arrow.triangle.branch")
+                    .font(.caption.monospaced())
+                    .lineLimit(1).truncationMode(.middle)
+                    .help(repo.url.path)
             }
         }
-        .font(.caption).foregroundStyle(.secondary)
-        .padding(.horizontal, 11).padding(.vertical, 5)
-        .background(DeskStyle.panel)
-    }
-
-    private func sectionHeader(_ title: String, icon: String, count: Int?) -> some View {
-        HStack(spacing: 7) {
-            Image(systemName: icon).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary).accessibilityHidden(true)
-            Text(title).font(.system(size: 12, weight: .semibold))
-            Spacer()
-            if let count { Text(String(count)).font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
-        }
-        .foregroundStyle(DeskStyle.ink)
-        .padding(.horizontal, 12).padding(.vertical, 9)
-    }
-
-    private func row<LabelView: View>(key: String, selected: Bool, action: @escaping () -> Void, @ViewBuilder content: () -> LabelView) -> some View {
-        Button(action: action) {
-            content()
-                .foregroundStyle(DeskStyle.ink)
-                .padding(.horizontal, 8).padding(.vertical, 6)
-                .frame(maxWidth: .infinity, minHeight: 32, alignment: .leading)
-                .background(selected ? DeskStyle.selected : hoveredRow == key ? DeskStyle.canvas : .clear,
-                            in: RoundedRectangle(cornerRadius: 6))
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onHover { hoveredRow = $0 ? key : (hoveredRow == key ? nil : hoveredRow) }
-        .accessibilityAddTraits(selected ? .isSelected : [])
-    }
-
-    private func secondary(_ text: String) -> some View {
-        Text(text).font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 8).padding(.bottom, 5)
-    }
-
-    private func empty<Actions: View>(_ title: String, icon: String, detail: String, @ViewBuilder actions: () -> Actions) -> some View {
-        VStack(spacing: 8) {
-            Image(systemName: icon).font(.system(size: 27)).foregroundStyle(.secondary)
-            Text(title).font(.headline)
-            Text(detail).font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center).textSelection(.enabled)
-            actions()
-        }.padding(20).frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private func statusColor(_ file: Change) -> Color {
-        if file.layers.contains(.conflict) { return .orange }
-        if file.status.contains("D") { return .red }
-        if file.status.contains("A") || file.status == "?" { return .green }
-        return .secondary
+        .font(.caption.monospacedDigit())
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 13)
+        .frame(height: 28)
+        .background(.bar)
     }
 
     private var baseEditor: some View {
@@ -654,118 +917,5 @@ struct DeskView: View {
                  .disabled(commitText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }.padding(20).frame(width: 450)
-    }
-}
-
-private struct PreviewFeedback: ViewModifier {
-    let revision: UUID
-    let mode: Workspace.Mode
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var opacity = 1.0
-
-    func body(content: Content) -> some View {
-        content.opacity(opacity)
-            .onAppear(perform: acknowledge)
-            .onChange(of: revision) { _, _ in acknowledge() }
-            .onChange(of: mode) { _, _ in acknowledge() }
-    }
-
-    private func acknowledge() {
-        guard !reduceMotion else { opacity = 1; return }
-        withAnimation(nil) { opacity = 0.83 }
-        withAnimation(.easeOut(duration: 0.15)) { opacity = 1 }
-    }
-}
-
-struct SplitComparison: View {
-    let comparison: Comparison
-    let path: String
-    @State private var link = ComparisonText.ScrollLink()
-    @State private var selectedHunk = 0
-    @State private var revealRevision = 0
-
-    var body: some View {
-        let hunks = comparison.hunks
-        VStack(spacing: 0) {
-            if !comparison.rows.isEmpty {
-                hunkBar(count: hunks.count)
-                Divider()
-            }
-            HStack(spacing: 0) {
-                pane(comparison.left, left: true, hunk: hunks.indices.contains(selectedHunk) ? hunks[selectedHunk] : hunks.first)
-                DeskStyle.border.frame(width: 1)
-                pane(comparison.right, left: false, hunk: hunks.indices.contains(selectedHunk) ? hunks[selectedHunk] : hunks.first)
-            }
-            if !comparison.aligned {
-                Text("文件行数较多，显示两个完整版本。")
-                    .font(.caption).foregroundStyle(.secondary).padding(5)
-            }
-        }
-        .onChange(of: hunks) { _, _ in selectedHunk = 0 }
-    }
-
-    private func hunkBar(count: Int) -> some View {
-        HStack(spacing: 6) {
-            Text(count == 0 ? "没有行变更" : "\(count) 处改动 · \(min(selectedHunk + 1, count)) / \(count)")
-                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                .accessibilityAddTraits(.updatesFrequently)
-            Spacer()
-            hunkButton("上一处改动", icon: "chevron.up", step: -1, count: count)
-            hunkButton("下一处改动", icon: "chevron.down", step: 1, count: count)
-        }
-        .padding(.horizontal, 12)
-        .frame(height: 32)
-        .background(DeskStyle.panel)
-    }
-
-    private func hunkButton(_ label: String, icon: String, step: Int, count: Int) -> some View {
-        Button {
-            guard count > 0 else { return }
-            selectedHunk = (min(selectedHunk, count - 1) + step + count) % count
-            revealRevision += 1
-        } label: {
-            Label(label, systemImage: icon).labelStyle(.iconOnly)
-        }
-        .buttonStyle(DeskButton())
-        .help(label)
-        .disabled(count == 0)
-    }
-
-    private func pane(_ snapshot: Snapshot, left: Bool, hunk: Range<Int>?) -> some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 7) {
-                Image(systemName: left ? "arrow.uturn.backward" : "arrow.right")
-                    .font(.system(size: 10, weight: .semibold)).accessibilityHidden(true)
-                Text(snapshot.label).lineLimit(1)
-                Spacer()
-                if let size = snapshot.size, snapshot.text == nil {
-                    Text(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)).lineLimit(1)
-                }
-            }
-            .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
-            .padding(.horizontal, 12).frame(height: 34)
-            .background(DeskStyle.panel)
-            Divider()
-            if comparison.aligned, !comparison.rows.isEmpty {
-                ComparisonText(comparison: comparison, left: left, scrollLink: link,
-                               activeHunk: hunk, revealRevision: revealRevision)
-                    .accessibilityLabel(snapshot.label)
-            } else {
-                FilePreview(snapshot: snapshot, path: path)
-            }
-        }.frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
-private struct WindowDragArea: NSViewRepresentable {
-    func makeNSView(context: Context) -> DragView { DragView() }
-    func updateNSView(_ view: DragView, context: Context) {}
-
-    final class DragView: NSView {
-        override var mouseDownCanMoveWindow: Bool { false }
-
-        override func mouseDown(with event: NSEvent) {
-            window?.performDrag(with: event)
-        }
     }
 }
