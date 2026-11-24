@@ -36,7 +36,27 @@ struct Worktree: Identifiable, Sendable {
     let changes: [Change]
     var issue: String? = nil
     var pending = false
+    private let changeIndexes: [String: Int]
     var id: URL { url }
+
+    init(url: URL, branch: String, head: String?, base: String?, ancestor: String?, changes: [Change],
+         issue: String? = nil, pending: Bool = false) {
+        self.url = url
+        self.branch = branch
+        self.head = head
+        self.base = base
+        self.ancestor = ancestor
+        self.changes = changes
+        self.issue = issue
+        self.pending = pending
+        changeIndexes = Dictionary(changes.enumerated().map { ($0.element.id, $0.offset) },
+                                   uniquingKeysWith: { first, _ in first })
+    }
+
+    func change(id: String?) -> Change? {
+        guard let id, let index = changeIndexes[id] else { return nil }
+        return changes[index]
+    }
 }
 
 enum PreviewKind: Equatable, Sendable {
@@ -117,27 +137,77 @@ struct Snapshot: Sendable {
 }
 
 struct Comparison: Sendable {
-    let id = UUID()
     let left: Snapshot
     let right: Snapshot
     let disk: Snapshot
-    let rows: [CodeRow]
-    var aligned: Bool = true
-    var ignoresWhitespace = false
+    private let diff: LineDiff
 
-    var hunks: [Range<Int>] {
-        var ranges: [Range<Int>] = []
-        var start: Int?
-        for (index, row) in rows.enumerated() {
-            if row.changed {
-                if start == nil { start = index }
-            } else if let first = start {
-                ranges.append(first..<index)
-                start = nil
+    var id: UUID { diff.id }
+    var rows: [CodeRow] { diff.rows }
+    var aligned: Bool { diff.aligned }
+    var ignoresWhitespace: Bool { diff.ignoresWhitespace }
+    var hunks: [Range<Int>] { diff.hunks }
+    var additions: Int { diff.additions }
+    var deletions: Int { diff.deletions }
+
+    init(left: Snapshot, right: Snapshot, disk: Snapshot, rows: [CodeRow],
+         aligned: Bool = true, ignoresWhitespace: Bool = false) {
+        self.init(left: left, right: right, disk: disk,
+                  diff: LineDiff(rows: rows, aligned: aligned, ignoresWhitespace: ignoresWhitespace))
+    }
+
+    private init(left: Snapshot, right: Snapshot, disk: Snapshot, diff: LineDiff) {
+        self.left = left
+        self.right = right
+        self.disk = disk
+        self.diff = diff
+    }
+
+    func reusingDiff(left: Snapshot, right: Snapshot, disk: Snapshot,
+                     ignoresWhitespace: Bool) -> Comparison? {
+        guard self.ignoresWhitespace == ignoresWhitespace,
+              self.left.hasSameText(as: left), self.right.hasSameText(as: right) else { return nil }
+        return Comparison(left: left, right: right, disk: disk, diff: diff)
+    }
+
+    private struct LineDiff: Sendable {
+        let id = UUID()
+        let rows: [CodeRow]
+        let aligned: Bool
+        let ignoresWhitespace: Bool
+        let hunks: [Range<Int>]
+        let additions: Int
+        let deletions: Int
+
+        init(rows: [CodeRow], aligned: Bool, ignoresWhitespace: Bool) {
+            self.rows = rows
+            self.aligned = aligned
+            self.ignoresWhitespace = ignoresWhitespace
+            var ranges: [Range<Int>] = []
+            var start: Int?
+            var additions = 0
+            var deletions = 0
+            for (index, row) in rows.enumerated() {
+                if row.changed {
+                    if start == nil { start = index }
+                    if row.rightNumber != nil { additions += 1 }
+                    if row.leftNumber != nil { deletions += 1 }
+                } else if let first = start {
+                    ranges.append(first..<index)
+                    start = nil
+                }
             }
+            if let start { ranges.append(start..<rows.count) }
+            hunks = ranges
+            self.additions = additions
+            self.deletions = deletions
         }
-        if let start { ranges.append(start..<rows.count) }
-        return ranges
+    }
+}
+
+private extension Snapshot {
+    func hasSameText(as other: Snapshot) -> Bool {
+        present == other.present && (text == nil) == (other.text == nil) && bytes == other.bytes
     }
 }
 
@@ -390,7 +460,8 @@ enum Git {
         return Snapshot(title, kind: kind, size: count, preview: preview)
     }
 
-    static func compare(_ file: Change, layer: Layer, repo: Worktree, ignoresWhitespace: Bool = false) throws -> Comparison {
+    static func compare(_ file: Change, layer: Layer, repo: Worktree, ignoresWhitespace: Bool = false,
+                        previous: Comparison? = nil) throws -> Comparison {
         let current = try disk(file.path, in: repo.url)
         let old = file.oldPath ?? file.path
         let left: Snapshot
@@ -418,6 +489,10 @@ enum Git {
         let r = right.present ? right.text : (left.text == nil ? nil : "")
         guard let l, let r else {
             return Comparison(left: left, right: right, disk: current, rows: [])
+        }
+        if let reused = previous?.reusingDiff(left: left, right: right, disk: current,
+                                             ignoresWhitespace: ignoresWhitespace) {
+            return reused
         }
         let result = try align(l, r, ignoresWhitespace: ignoresWhitespace)
         return Comparison(left: left, right: right, disk: current, rows: result.0,
@@ -457,6 +532,7 @@ enum Git {
             if rhs { j += 1 }
         }
         for line in patch.split(separator: "\n") where line.hasPrefix("@@ ") {
+            try Task.checkCancellation()
             let s = String(line) as NSString
             guard let match = regex.firstMatch(in: String(line), range: NSRange(location: 0, length: s.length)) else { continue }
             func number(_ group: Int, default missing: Int = 1) -> Int {

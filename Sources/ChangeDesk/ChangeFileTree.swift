@@ -73,3 +73,56 @@ struct ChangeFileTree {
         return order == .orderedSame ? lhs < rhs : order == .orderedAscending
     }
 }
+
+/// Retains the selected worktree's file list across code searches and scan updates.
+final class ChangeListCache {
+    struct List {
+        let rows: [ChangeFileTree.Entry]
+        let uniquePaths: Int
+        let total: Int
+        let work: Int
+        let branch: Int
+
+        func count(in group: Group?) -> Int {
+            switch group {
+            case .work: work
+            case .branch: branch
+            case nil: total
+            }
+        }
+    }
+
+    private var changes: [Change] = []
+    private var group: Group?
+    private var query = ""
+    private var expanded: Set<String> = []
+    private var tree = ChangeFileTree(changes: [], query: SearchQuery(""))
+    private var rows: [ChangeFileTree.Entry] = []
+    private var uniquePaths = 0
+    private var work = 0
+
+    func list(changes: [Change], group: Group?, query: String, expanded: Set<String>) -> List {
+        let sourceChanged = self.changes != changes
+        let groupChanged = self.group != group
+        let queryChanged = self.query != query
+        let treeChanged = sourceChanged || groupChanged || queryChanged
+        if sourceChanged {
+            work = changes.lazy.filter { $0.group == .work }.count
+        }
+        if treeChanged {
+            let filtered = group.map { group in changes.filter { $0.group == group } } ?? changes
+            if sourceChanged || groupChanged { uniquePaths = Set(filtered.map(\.path)).count }
+            tree = ChangeFileTree(changes: filtered, query: SearchQuery(query))
+        }
+        if treeChanged || self.expanded != expanded {
+            let filtering = !SearchQuery(query).isEmpty
+            rows = tree.rows { expanded.contains($0) != filtering }
+        }
+        self.changes = changes
+        self.group = group
+        self.query = query
+        self.expanded = expanded
+        return List(rows: rows, uniquePaths: uniquePaths, total: changes.count,
+                    work: work, branch: changes.count - work)
+    }
+}

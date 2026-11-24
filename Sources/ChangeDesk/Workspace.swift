@@ -27,7 +27,7 @@ final class Workspace: ObservableObject {
     enum FullVersion: String, CaseIterable { case left = "左侧版本", right = "右侧版本", disk = "工作区" }
     @Published var fullVersion: FullVersion = .right
     var repo: Worktree? { repos.first { $0.id == repoID } }
-    var file: Change? { repo?.changes.first { $0.id == fileID } }
+    var file: Change? { repo?.change(id: fileID) }
     var hasDraft: Bool { editing && Data(draft.utf8) != comparison?.disk.bytes }
     var fullSnapshot: Snapshot? {
         switch fullVersion {
@@ -53,6 +53,7 @@ final class Workspace: ObservableObject {
     private var refreshAgain = false
     private var manualRefreshQueued = false
     private var scanTask: Task<Void, Never>?
+    private var fileLoadTask: Task<Void, Never>?
     private var changedPaths: Set<String> = []
 
     init(environment: UserDefaults = .standard) {
@@ -99,6 +100,7 @@ final class Workspace: ObservableObject {
     func open(_ url: URL) {
         let root = url.resolvingSymlinksInPath().standardizedFileURL
         scanTask?.cancel()
+        fileLoadTask?.cancel()
         delayedRefresh?.cancel()
         refreshAgain = false
         manualRefreshQueued = false
@@ -165,7 +167,7 @@ final class Workspace: ObservableObject {
         changedPaths = []
         let priority = repoID
         let bases = environment.dictionary(forKey: "bases")?.compactMapValues { $0 as? String } ?? [:]
-        scanTask = Task.detached(priority: .userInitiated) { [weak self] in
+        scanTask = Task.detached(priority: automatic ? .utility : .userInitiated) { [weak self] in
             let needsDiscovery = !automatic || previous.isEmpty || pathsChanged.contains { path in
                 !previous.keys.contains(where: { path.hasPrefix($0.path + "/") }) ||
                 path.hasSuffix("/.git") || path.contains("/.git/worktrees/")
@@ -276,6 +278,7 @@ final class Workspace: ObservableObject {
     }
 
     func loadFile(preserveScroll: Bool = false) {
+        fileLoadTask?.cancel()
         let token = UUID()
         loadToken = token
         if !preserveScroll || file == nil { comparison = nil; layoutRevision = UUID() }
@@ -284,15 +287,26 @@ final class Workspace: ObservableObject {
         loading = true
         let selectedLayer = layer
         let ignoresWhitespace = self.ignoresWhitespace
-        Task {
-            let result = await Task.detached(priority: .userInitiated) {
-                Result { try Git.compare(file, layer: selectedLayer, repo: repo, ignoresWhitespace: ignoresWhitespace) }
-            }.value
-            guard token == loadToken, !editing else { return }
-            loading = false
+        let previous = preserveScroll ? comparison : nil
+        let worker = Task.detached(priority: .userInitiated) {
+            Result {
+                try Git.compare(file, layer: selectedLayer, repo: repo,
+                                ignoresWhitespace: ignoresWhitespace, previous: previous)
+            }
+        }
+        fileLoadTask = Task { [weak self] in
+            let result = await withTaskCancellationHandler {
+                await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
+            guard !Task.isCancelled, let self, token == self.loadToken, !self.editing else { return }
+            self.loading = false
             switch result {
-            case .success(let value): comparison = value
-            case .failure(let error): comparison = nil; fileIssue = error.localizedDescription
+            case .success(let value): self.comparison = value
+            case .failure(let error):
+                self.comparison = nil
+                self.fileIssue = error.localizedDescription
             }
         }
     }
