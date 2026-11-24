@@ -90,6 +90,7 @@ struct DeskView: View {
     @DeskState private var expandedDirectories: Set<String> = []
     @DeskState private var collapsedSearchDirectories: Set<String> = []
     @DeskState private var changeScope: ChangeScope = .all
+    @DeskState private var changeListCache = ChangeListCache()
     @DeskState private var selection = NavigationSplitViewVisibility.all
     @DeskState private var showOutline = false
     @DeskState private var outlineSide = SourceSide.after
@@ -455,14 +456,16 @@ struct DeskView: View {
     }
 
     private var changesPane: some View {
-        let changes = model.repo?.changes ?? []
-        let filtered = changes.filter { changeScope.group == nil || $0.group == changeScope.group }
         let query = SearchQuery(directoryFilter)
-        let rows = ChangeFileTree(changes: filtered, query: query).rows { isExpanded($0, query: query) }
+        let list = changeListCache.list(changes: model.repo?.changes ?? [], group: changeScope.group,
+                                        query: directoryFilter,
+                                        expanded: query.isEmpty ? expandedDirectories : collapsedSearchDirectories)
         let selected = Binding<String?>(
             get: { model.fileID },
             set: { next in
-                if let file = filtered.first(where: { $0.id == next }) { model.chooseFile(file) }
+                if let file = model.repo?.change(id: next), changeScope.group == nil || file.group == changeScope.group {
+                    model.chooseFile(file)
+                }
             }
         )
         return VStack(spacing: 0) {
@@ -470,7 +473,7 @@ struct DeskView: View {
                 Text("变更").font(.headline).accessibilityAddTraits(.isHeader)
                 Spacer()
                 if model.repo?.pending == false {
-                    Text("\(Set(filtered.map(\.path)).count) 个文件")
+                    Text("\(list.uniquePaths) 个文件")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
@@ -479,7 +482,7 @@ struct DeskView: View {
             .padding(.top, 12)
 
             searchField("筛选目录或文件", text: $directoryFilter, field: .files) {
-                for row in rows {
+                for row in list.rows {
                     if case let .file(file) = row.item { model.chooseFile(file); break }
                 }
             }
@@ -487,7 +490,7 @@ struct DeskView: View {
 
             Picker("变更范围", selection: Binding(get: { changeScope }, set: selectScope)) {
                 ForEach(ChangeScope.allCases, id: \.self) { scope in
-                    let count = changes.lazy.filter { scope.group == nil || $0.group == scope.group }.count
+                    let count = list.count(in: scope.group)
                     let indicator = model.repo?.pending == true ? "…" :
                         scope == .branch && model.repo?.ancestor == nil ? "—" : count.formatted()
                     Text("\(scope.rawValue) \(indicator)").tag(scope)
@@ -499,12 +502,12 @@ struct DeskView: View {
             .padding(.bottom, 9)
 
             Divider()
-            if rows.isEmpty {
+            if list.rows.isEmpty {
                 listEmpty(query: query)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List(selection: selected) {
-                    ForEach(rows) { entry in treeRow(entry, query: query) }
+                    ForEach(list.rows) { entry in treeRow(entry, query: query) }
                 }
                 .listStyle(.inset(alternatesRowBackgrounds: false))
             }

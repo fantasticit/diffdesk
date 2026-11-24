@@ -11,19 +11,24 @@ struct NativeText: NSViewRepresentable {
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         var onChange: (String) -> Void
+        var content: String
         var jumpID: UUID?
         let viewport = ViewportMonitor()
         let search = TextSearchHighlighter()
-        init(_ onChange: @escaping (String) -> Void) { self.onChange = onChange }
+        init(text: String, onChange: @escaping (String) -> Void) {
+            content = text
+            self.onChange = onChange
+        }
         func textDidChange(_ notification: Notification) {
             if let textView = notification.object as? NSTextView {
                 search.clear(in: textView, textWasEdited: true)
-                onChange(textView.string)
+                content = textView.string
+                onChange(content)
             }
         }
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator(onChange) }
+    func makeCoordinator() -> Coordinator { Coordinator(text: text, onChange: onChange) }
 
     func makeNSView(context: Context) -> NSScrollView {
         Self.makeScroll(text: text, editable: editable, delegate: context.coordinator)
@@ -36,6 +41,16 @@ struct NativeText: NSViewRepresentable {
         scroll.hasHorizontalScroller = true
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
+        configure(view, editable: editable)
+        view.textColor = .textColor
+        view.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        view.delegate = delegate
+        view.layoutManager?.allowsNonContiguousLayout = true
+        view.string = text
+        return scroll
+    }
+
+    static func configure(_ view: NSTextView, editable: Bool) {
         view.minSize = .zero
         view.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         view.isHorizontallyResizable = true
@@ -44,9 +59,7 @@ struct NativeText: NSViewRepresentable {
         view.textContainer?.widthTracksTextView = false
         view.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         view.backgroundColor = .textBackgroundColor
-        view.textColor = .textColor
         view.insertionPointColor = .textColor
-        view.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         view.textContainerInset = NSSize(width: 12, height: 10)
         view.isRichText = false
         view.importsGraphics = false
@@ -59,9 +72,6 @@ struct NativeText: NSViewRepresentable {
         view.allowsUndo = editable
         view.isEditable = editable
         view.isSelectable = true
-        view.delegate = delegate
-        view.string = text
-        return scroll
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
@@ -70,9 +80,10 @@ struct NativeText: NSViewRepresentable {
         view.isEditable = editable
         view.allowsUndo = editable
         let state = context.coordinator
-        if !view.string.utf8.elementsEqual(text.utf8) {
+        if !state.content.utf8.elementsEqual(text.utf8) {
             state.search.clear(in: view)
             view.string = text
+            state.content = text
         }
         state.search.update(searchMarks, in: view, scroll: scroll) { $0.row == nil ? $0.range : nil }
         state.viewport.attach(viewport, to: scroll)
@@ -120,8 +131,8 @@ enum DiffTone: Sendable {
     }
 }
 
-struct ComparisonText: NSViewRepresentable {
-    enum Presentation { case before, after, unified }
+struct ComparisonText: View {
+    typealias Presentation = DiffTextDocument.Presentation
 
     let comparison: Comparison
     let presentation: Presentation
@@ -131,19 +142,57 @@ struct ComparisonText: NSViewRepresentable {
     var viewport: TextViewport?
     var jump: TextJump?
     var searchMarks: FileSearchMarks?
+    @DeskState private var prepared: DiffTextDocument?
+
+    var body: some View {
+        let key = DiffTextDocument.Key(comparisonID: comparison.id, presentation: presentation)
+        ComparisonTextView(document: prepared, ready: prepared?.key == key,
+                           presentation: presentation, scrollLink: scrollLink,
+                           activeHunk: activeHunk, revealRevision: revealRevision,
+                           viewport: viewport, jump: jump, searchMarks: searchMarks)
+            .overlay {
+                if prepared == nil {
+                    ProgressView().controlSize(.small).accessibilityLabel("正在加载代码差异")
+                }
+            }
+            .task(id: key) {
+                let comparison = comparison
+                let worker = Task.detached(priority: .userInitiated) {
+                    try DiffTextDocument.build(comparison, key: key)
+                }
+                let result = try? await withTaskCancellationHandler {
+                    try await worker.value
+                } onCancel: {
+                    worker.cancel()
+                }
+                guard !Task.isCancelled, let result else { return }
+                prepared = result
+            }
+    }
 
     final class ScrollLink: NSObject {
-        weak var lhs: NSScrollView?
-        weak var rhs: NSScrollView?
-        var syncing = false
+        private weak var lhs: NSScrollView?
+        private weak var rhs: NSScrollView?
+        private var syncing = false
 
         func attach(_ view: NSScrollView, left: Bool) {
+            let peer = left ? rhs : lhs
             if left { lhs = view } else { rhs = view }
+            if let peer { synchronize(from: peer.contentView, to: view) }
+        }
+
+        func detach(_ view: NSScrollView) {
+            if lhs === view { lhs = nil }
+            if rhs === view { rhs = nil }
         }
 
         @objc func moved(_ notification: Notification) {
             guard !syncing, let lhs, let rhs, let clip = notification.object as? NSClipView else { return }
             let other = clip === lhs.contentView ? rhs : lhs
+            synchronize(from: clip, to: other)
+        }
+
+        private func synchronize(from clip: NSClipView, to other: NSScrollView) {
             var bounds = other.contentView.bounds
             bounds.origin.y = clip.bounds.origin.y
             let point = other.contentView.constrainBoundsRect(bounds).origin
@@ -155,27 +204,34 @@ struct ComparisonText: NSViewRepresentable {
         }
     }
 
-    struct Span {
-        let sourceRow: Int
-        let range: NSRange
-        let gutterRange: NSRange
-        let tone: DiffTone?
-        let left: Int?
-        let right: Int?
-    }
+}
+
+private struct ComparisonTextView: NSViewRepresentable {
+    let document: DiffTextDocument?
+    let ready: Bool
+    let presentation: ComparisonText.Presentation
+    let scrollLink: ComparisonText.ScrollLink?
+    let activeHunk: Range<Int>?
+    let revealRevision: Int
+    let viewport: TextViewport?
+    let jump: TextJump?
+    let searchMarks: FileSearchMarks?
 
     final class Coordinator {
-        var before: Data?
-        var after: Data?
-        var presentation: Presentation?
-        var ignoresWhitespace = false
-        var link: ScrollLink?
-        var spans: [Span] = []
+        var document: DiffTextDocument?
+        var link: ComparisonText.ScrollLink?
         var highlighted: Range<Int>?
         var revealRevision = 0
         var jumpID: UUID?
         let viewport = ViewportMonitor()
         let search = TextSearchHighlighter()
+
+        func detachLink(from scroll: NSScrollView) {
+            guard let link else { return }
+            NotificationCenter.default.removeObserver(link, name: NSView.boundsDidChangeNotification, object: scroll.contentView)
+            link.detach(scroll)
+            self.link = nil
+        }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -185,53 +241,55 @@ struct ComparisonText: NSViewRepresentable {
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
-        guard let view = scroll.documentView as? NSTextView else { return }
+        guard var view = scroll.documentView as? NSTextView else { return }
         let state = context.coordinator
-        if state.link !== scrollLink {
-            if let old = state.link {
-                NotificationCenter.default.removeObserver(old, name: NSView.boundsDidChangeNotification, object: scroll.contentView)
-            }
-            state.link = scrollLink
-            if let scrollLink {
-                scrollLink.attach(scroll, left: presentation == .before)
-                scroll.contentView.postsBoundsChangedNotifications = true
-                NotificationCenter.default.addObserver(scrollLink, selector: #selector(ScrollLink.moved(_:)),
-                                                       name: NSView.boundsDidChangeNotification, object: scroll.contentView)
-            }
-        }
-        if state.before != comparison.left.bytes || state.after != comparison.right.bytes
-            || state.presentation != presentation || state.ignoresWhitespace != comparison.ignoresWhitespace {
+        if state.link !== scrollLink { state.detachLink(from: scroll) }
+        if let document, state.document?.key != document.key {
             let scrollPosition = scroll.contentView.bounds.origin
-            let output = makeText()
+            state.detachLink(from: scroll)
             state.search.clear(in: view)
-            state.before = comparison.left.bytes
-            state.after = comparison.right.bytes
-            state.presentation = presentation
-            state.ignoresWhitespace = comparison.ignoresWhitespace
-            state.spans = output.spans
             state.highlighted = nil
-            view.textStorage?.setAttributedString(output.text)
+            state.jumpID = nil
+            if let layout = document.splitLayout {
+                state.viewport.detach()
+                let replacement = NSTextView(frame: view.frame, textContainer: layout.container)
+                NativeText.configure(replacement, editable: false)
+                scroll.documentView = replacement
+                view = replacement
+            } else {
+                view.textStorage?.setAttributedString(document.text)
+            }
+            state.document = document
             scroll.contentView.scroll(to: scrollPosition)
             scroll.reflectScrolledClipView(scroll.contentView)
         }
         state.viewport.attach(viewport, to: scroll)
         state.viewport.schedule()
-        updateHighlight(in: view, scroll: scroll, state: state)
+        guard ready, let document else { return }
+        if state.link == nil, let scrollLink {
+            state.link = scrollLink
+            scrollLink.attach(scroll, left: presentation == .before)
+            scroll.contentView.postsBoundsChangedNotifications = true
+            NotificationCenter.default.addObserver(scrollLink, selector: #selector(ComparisonText.ScrollLink.moved(_:)),
+                                                   name: NSView.boundsDidChangeNotification, object: scroll.contentView)
+        }
+        let spans = document.spans
+        updateHighlight(in: view, scroll: scroll, state: state, document: document)
         state.search.update(searchMarks, in: view, scroll: scroll) { match in
-            guard let row = match.row, state.spans.indices.contains(row) else { return nil }
-            let span = state.spans[row]
+            guard let row = match.row, spans.indices.contains(row) else { return nil }
+            let span = spans[row]
             let location = NSMaxRange(span.gutterRange) + match.range.location
             guard location + match.range.length <= NSMaxRange(span.range) else { return nil }
             return NSRange(location: location, length: match.range.length)
         }
         if let jump, jump.id != state.jumpID {
             state.jumpID = jump.id
-            let span: Span?
+            let span: DiffTextDocument.Span?
             switch jump.target {
             case let .displayRow(index):
-                span = state.spans.indices.contains(index) ? state.spans[index] : nil
+                span = spans.indices.contains(index) ? spans[index] : nil
             case let .source(line, side):
-                span = state.spans.first { (side == .after ? $0.right : $0.left) == line }
+                span = spans.first { (side == .after ? $0.right : $0.left) == line }
             }
             if let span {
                 scroll.revealText(span.range, in: view)
@@ -244,84 +302,32 @@ struct ComparisonText: NSViewRepresentable {
         }
     }
 
-    private func makeText() -> (text: NSAttributedString, spans: [Span]) {
-        let output = NSMutableAttributedString()
-        var spans: [Span] = []
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.minimumLineHeight = 19
-        paragraph.maximumLineHeight = 19
-        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: font, .foregroundColor: NSColor.textColor, .paragraphStyle: paragraph
-        ]
-
-        func gutter(_ value: Int?) -> String { value.map { String(format: "%5d", $0) } ?? "     " }
-
-        func append(_ index: Int, before: Int?, after: Int?, code: String, tone: DiffTone?, emphasis: [NSRange]) {
-            if output.length > 0 { output.append(NSAttributedString(string: "\n", attributes: attrs)) }
-            let numbers = presentation == .unified ? gutter(before) + " " + gutter(after) :
-                gutter(presentation == .before ? before : after)
-            let mark = tone.map { $0 == .deletion ? " − " : " + " } ?? "   "
-            let prefix = numbers + mark
-            let codeOffset = prefix.utf16.count
-            let line = NSMutableAttributedString(string: prefix + InlineDiff.displayText(code), attributes: attrs)
-            line.addAttribute(.foregroundColor, value: tone?.ink ?? NSColor.secondaryLabelColor,
-                              range: NSRange(location: 0, length: codeOffset))
-            if let tone {
-                line.addAttribute(.backgroundColor, value: tone.tint.withAlphaComponent(0.12),
-                                  range: NSRange(location: 0, length: line.length))
-                for range in emphasis {
-                    line.addAttribute(.backgroundColor, value: tone.emphasis,
-                                      range: NSRange(location: codeOffset + range.location, length: range.length))
-                }
-            }
-            spans.append(Span(sourceRow: index, range: NSRange(location: output.length, length: line.length),
-                              gutterRange: NSRange(location: output.length, length: codeOffset),
-                              tone: tone, left: before, right: after))
-            output.append(line)
-        }
-
-        if presentation == .unified {
-            for line in comparison.unifiedLines() {
-                append(line.sourceRow, before: line.left, after: line.right, code: line.code,
-                       tone: line.tone, emphasis: line.emphasis)
-            }
-        } else {
-            let left = presentation == .before
-            for (index, row) in comparison.rows.enumerated() {
-                let number = left ? row.leftNumber : row.rightNumber
-                let tone: DiffTone? = row.changed && number != nil ? (left ? .deletion : .addition) : nil
-                let emphasis = left ? row.emphasis?.left : row.emphasis?.right
-                append(index, before: row.leftNumber, after: row.rightNumber,
-                       code: (left ? row.left : row.right) ?? "", tone: tone, emphasis: emphasis ?? [])
-            }
-        }
-        return (output, spans)
-    }
-
-    private func updateHighlight(in view: NSTextView, scroll: NSScrollView, state: Coordinator) {
+    private func updateHighlight(in view: NSTextView, scroll: NSScrollView,
+                                 state: Coordinator, document: DiffTextDocument) {
         if state.highlighted != activeHunk, let layout = view.layoutManager {
-            for span in state.spans {
-                if state.highlighted?.contains(span.sourceRow) == true {
+            if let previous = state.highlighted {
+                for span in document.displaySpans(for: previous) {
                     layout.removeTemporaryAttribute(.backgroundColor, forCharacterRange: span.gutterRange)
                 }
-                if activeHunk?.contains(span.sourceRow) == true, let tone = span.tone {
-                    layout.addTemporaryAttribute(.backgroundColor, value: tone.tint.withAlphaComponent(0.26),
-                                                 forCharacterRange: span.gutterRange)
+            }
+            if let activeHunk {
+                for span in document.displaySpans(for: activeHunk) {
+                    if let tone = span.tone {
+                        layout.addTemporaryAttribute(.backgroundColor, value: tone.tint.withAlphaComponent(0.26),
+                                                     forCharacterRange: span.gutterRange)
+                    }
                 }
             }
             state.highlighted = activeHunk
         }
         guard state.revealRevision != revealRevision else { return }
         state.revealRevision = revealRevision
-        guard let hunk = activeHunk, let span = state.spans.first(where: { hunk.contains($0.sourceRow) }) else { return }
+        guard let hunk = activeHunk, let span = document.displaySpans(for: hunk).first else { return }
         scroll.revealText(span.range, in: view)
     }
 
     static func dismantleNSView(_ scroll: NSScrollView, coordinator: Coordinator) {
         coordinator.viewport.detach()
-        if let link = coordinator.link {
-            NotificationCenter.default.removeObserver(link, name: NSView.boundsDidChangeNotification, object: scroll.contentView)
-        }
+        coordinator.detachLink(from: scroll)
     }
 }

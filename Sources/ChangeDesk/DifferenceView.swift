@@ -55,9 +55,8 @@ struct DifferenceView: View {
     }
 
     private func hunkBar(count: Int) -> some View {
-        let rows = comparison.rows.lazy.filter(\.changed)
-        let additions = rows.filter { $0.rightNumber != nil }.count
-        let deletions = rows.filter { $0.leftNumber != nil }.count
+        let additions = comparison.additions
+        let deletions = comparison.deletions
         return HStack(spacing: 10) {
             Text("+\(additions)")
                 .foregroundStyle(DeskStyle.added).accessibilityLabel("新增 \(additions) 行")

@@ -6,8 +6,8 @@ struct OutlineSource: Equatable, Sendable {
     let side: SourceSide
 }
 
-private struct MinimapData: Sendable {
-    struct Mark: Sendable {
+private struct MinimapData: Equatable, Sendable {
+    struct Mark: Equatable, Sendable {
         var indent = 0
         var length = 0
         var addition = false
@@ -69,9 +69,8 @@ struct DocumentNavigator<Editor: View>: View {
     @DeskState private var minimap = MinimapData()
 
     private struct MapKey: Equatable {
-        let source: OutlineSource
-        let left: String?
-        let right: String?
+        let comparisonID: UUID?
+        let text: String?
         let unified: Bool
     }
 
@@ -99,8 +98,8 @@ struct DocumentNavigator<Editor: View>: View {
                 }
             }
         }
-        .task(id: MapKey(source: source, left: comparison?.left.text, right: comparison?.right.text,
-                         unified: unified)) {
+        .task(id: MapKey(comparisonID: comparison?.id,
+                         text: comparison?.rows.isEmpty == false ? nil : source.text, unified: unified)) {
             let comparison = comparison
             let text = source.text
             let unified = unified
@@ -236,29 +235,7 @@ private struct DocumentMinimap: View {
         GeometryReader { geometry in
             let height = min(max(1, geometry.size.height - 14), max(14, CGFloat(map.count) * 2.45))
             let position = viewport.position
-            Canvas { context, size in
-                guard !map.samples.isEmpty else { return }
-                let step = size.height / CGFloat(map.samples.count)
-                for (index, mark) in map.samples.enumerated() {
-                    let y = CGFloat(index) * step
-                    let strokeHeight = min(1.5, max(0.65, step * 0.68))
-                    let x = 9 + CGFloat(mark.indent) * 0.32
-                    let width = min(size.width - x - 6, CGFloat(mark.length) * 0.66)
-                    if width > 0 {
-                        let tint = mark.addition ? DeskStyle.added :
-                            mark.deletion ? DeskStyle.removed : Color.secondary
-                        let stroke = CGRect(x: x, y: y, width: width, height: strokeHeight)
-                        context.fill(Path(roundedRect: stroke, cornerRadius: 0.4),
-                                     with: .color(tint.opacity(mark.addition || mark.deletion ? 0.78 : 0.46)))
-                    }
-                    if mark.deletion {
-                        context.fill(Path(CGRect(x: 2, y: y, width: 2, height: max(1, step))), with: .color(DeskStyle.removed))
-                    }
-                    if mark.addition {
-                        context.fill(Path(CGRect(x: 5, y: y, width: 2, height: max(1, step))), with: .color(DeskStyle.added))
-                    }
-                }
-            }
+            MinimapInk(samples: map.samples).equatable()
             .overlay(alignment: .topLeading) {
                 let start = min(max(0, 1 - position.length), position.start)
                 RoundedRectangle(cornerRadius: 3)
@@ -292,6 +269,36 @@ private struct DocumentMinimap: View {
             case .increment: reveal(min(map.count - 1, current + offset))
             case .decrement: reveal(max(0, current - offset))
             @unknown default: break
+            }
+        }
+    }
+}
+
+private struct MinimapInk: View, Equatable {
+    let samples: [MinimapData.Mark]
+
+    var body: some View {
+        Canvas { context, size in
+            guard !samples.isEmpty else { return }
+            let step = size.height / CGFloat(samples.count)
+            for (index, mark) in samples.enumerated() {
+                let y = CGFloat(index) * step
+                let strokeHeight = min(1.5, max(0.65, step * 0.68))
+                let x = 9 + CGFloat(mark.indent) * 0.32
+                let width = min(size.width - x - 6, CGFloat(mark.length) * 0.66)
+                if width > 0 {
+                    let tint = mark.addition ? DeskStyle.added :
+                        mark.deletion ? DeskStyle.removed : Color.secondary
+                    let stroke = CGRect(x: x, y: y, width: width, height: strokeHeight)
+                    context.fill(Path(roundedRect: stroke, cornerRadius: 0.4),
+                                 with: .color(tint.opacity(mark.addition || mark.deletion ? 0.78 : 0.46)))
+                }
+                if mark.deletion {
+                    context.fill(Path(CGRect(x: 2, y: y, width: 2, height: max(1, step))), with: .color(DeskStyle.removed))
+                }
+                if mark.addition {
+                    context.fill(Path(CGRect(x: 5, y: y, width: 2, height: max(1, step))), with: .color(DeskStyle.added))
+                }
             }
         }
     }

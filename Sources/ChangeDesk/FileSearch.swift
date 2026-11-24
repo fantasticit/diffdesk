@@ -13,9 +13,7 @@ enum FileSearchDocument: Equatable, Sendable {
         case let (.text(left), .text(right)):
             left == right && left.utf8.elementsEqual(right.utf8)
         case let (.diff(left, leftSurface), .diff(right, rightSurface)):
-            leftSurface == rightSurface && (left.id == right.id ||
-                (left.left.bytes == right.left.bytes && left.right.bytes == right.right.bytes
-                 && left.ignoresWhitespace == right.ignoresWhitespace && left.aligned == right.aligned))
+            leftSurface == rightSurface && left.id == right.id
         default:
             false
         }

@@ -3,6 +3,7 @@ import AppKit
 final class TextSearchHighlighter {
     private var marks: FileSearchMarks?
     private var ranges: [NSRange] = []
+    private var activeRange: NSRange?
 
     func clear(in view: NSTextView, textWasEdited: Bool = false) {
         guard marks != nil, let layout = view.layoutManager else { return }
@@ -16,29 +17,42 @@ final class TextSearchHighlighter {
         }
         marks = nil
         ranges = []
+        activeRange = nil
     }
 
     func update(_ next: FileSearchMarks?, in view: NSTextView, scroll: NSScrollView,
                 range resolve: (FileSearchRequest.Match) -> NSRange?) {
         guard next != marks else { return }
         let shouldReveal = next?.revealID != nil && next?.revealID != marks?.revealID
-        clear(in: view)
-        guard let next, let layout = view.layoutManager, let storage = view.textStorage else { return }
-        marks = next
-        for match in next.matches {
-            guard let range = resolve(match), NSMaxRange(range) <= storage.length else { continue }
-            let active = match == next.active
-            layout.addTemporaryAttribute(.backgroundColor,
-                                         value: active ? NSColor.findHighlightColor : Self.matchColor,
-                                         forCharacterRange: range)
-            if active {
-                layout.addTemporaryAttribute(.foregroundColor, value: NSColor.black, forCharacterRange: range)
-                if shouldReveal {
-                    scroll.revealText(range, in: view)
-                    view.scrollRangeToVisible(range)
-                }
+        guard let next, let layout = view.layoutManager, let length = view.textStorage?.length else {
+            clear(in: view)
+            return
+        }
+
+        if marks?.matches != next.matches {
+            clear(in: view)
+            ranges = next.matches.compactMap(resolve).filter { NSMaxRange($0) <= length }
+            for range in ranges {
+                layout.addTemporaryAttribute(.backgroundColor, value: Self.matchColor, forCharacterRange: range)
             }
-            ranges.append(range)
+        }
+
+        let active = resolve(next.active).flatMap { NSMaxRange($0) <= length ? $0 : nil }
+        if activeRange != active {
+            if let previous = activeRange {
+                layout.removeTemporaryAttribute(.foregroundColor, forCharacterRange: previous)
+                layout.addTemporaryAttribute(.backgroundColor, value: Self.matchColor, forCharacterRange: previous)
+            }
+            if let active {
+                layout.addTemporaryAttributes([.backgroundColor: NSColor.findHighlightColor, .foregroundColor: NSColor.black],
+                                              forCharacterRange: active)
+            }
+            activeRange = active
+        }
+        marks = next
+        if shouldReveal, let active {
+            scroll.revealText(active, in: view)
+            view.scrollRangeToVisible(active)
         }
     }
 

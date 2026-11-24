@@ -5,7 +5,7 @@ struct InlineDiff: Sendable {
     let right: [NSRange]
 
     static func displayText(_ code: String) -> String {
-        code.replacingOccurrences(of: "\r", with: "")
+        code.utf8.contains(13) ? code.replacingOccurrences(of: "\r", with: "") : code
     }
 
     static func compare(_ left: String, _ right: String, budget: inout Int) -> InlineDiff? {
